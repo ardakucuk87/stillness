@@ -880,17 +880,23 @@ async function sha256Short(text) {
   const buf = await crypto.subtle.digest("SHA-256", enc);
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
 }
+// Tiny silent WAV used only to unlock the shared <audio> element on iOS
+// Safari (and any browser with strict autoplay rules). 44 bytes, no
+// audio frames — never replaces any voice recording.
+const SILENT_AUDIO_DATA_URL = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
 function useVoicePack(enabled, gender = "female") {
-  // ONE NEW Audio element PER SPEAK CALL. Each speak owns its own
-  // closure with private timer, handlers, and audio element. Previous
-  // speak is cancelled via a shared cancel ref. No shared mutable
-  // state between concurrent calls — that was causing "2 voices
-  // overlapping" because state from one speak was leaking into another.
+  // ONE shared Audio element. iOS/Safari ties autoplay permission to
+  // the specific element it was granted on, so a fresh `new Audio()`
+  // per line means every line after the first hits NotAllowedError.
+  // Reusing one element + priming it inside the start gesture keeps
+  // the whole session playable.
   const cacheRef = useRef(new Map()); // hash -> { url, duration }
   const inflightRef = useRef(new Map()); // hash -> Promise<entry>
   const missCacheRef = useRef(new Set());
   const cancelCurrentRef = useRef(null); // cancel fn for current play
   const busyRef = useRef(false);
+  const audioRef = useRef(null); // shared HTMLAudioElement
+  const primedRef = useRef(false);
   const [available, setAvailable] = useState(null);
 
   // Probe whether the voice pack exists. Uses GET (HEAD can be flaky on
@@ -919,7 +925,41 @@ function useVoicePack(enabled, gender = "female") {
     };
   }, [enabled, gender, available]);
 
-  // No shared audio element — each speak creates its own.
+  // Lazily build the single shared Audio element.
+  const getAudio = useCallback(() => {
+    if (!audioRef.current && typeof Audio !== "undefined") {
+      const a = new Audio();
+      a.preload = "auto";
+      a.playsInline = true;
+      audioRef.current = a;
+    }
+    return audioRef.current;
+  }, []);
+
+  // Prime the shared element by playing a 44-byte silent WAV. MUST be
+  // called synchronously inside a user gesture (start tap) so later
+  // play() calls outside the gesture are still permitted on iOS.
+  const prime = useCallback(() => {
+    if (primedRef.current) return;
+    const a = getAudio();
+    if (!a) return;
+    primedRef.current = true;
+    try {
+      a.src = SILENT_AUDIO_DATA_URL;
+      a.volume = 0;
+      const p = a.play();
+      if (p && p.then) {
+        p.then(() => {
+          try {
+            a.pause();
+          } catch {/* noop */}
+          a.volume = 1.0;
+        }).catch(() => {
+          a.volume = 1.0;
+        });
+      }
+    } catch {/* noop */}
+  }, [getAudio]);
 
   // Load an MP3, cache its blob URL + duration. Decoding is done once
   // just to learn duration; we discard the AudioBuffer immediately.
@@ -1001,18 +1041,20 @@ function useVoicePack(enabled, gender = "female") {
     }
     if (!entry) return false;
 
-    // Cancel any previous speak BEFORE creating a new audio element.
+    // Cancel any previous speak before swapping src on the shared element.
     stopNow();
     return await new Promise(resolve => {
-      // Everything below is private to THIS speak call. Each gets its
-      // own Audio, its own timer, its own done flag, its own finish.
+      const audio = getAudio();
+      if (!audio) {
+        resolve(false);
+        return;
+      }
       let done = false;
       let timeoutId = null;
-      const audio = new Audio();
-      audio.preload = "auto";
-      audio.playsInline = true;
-      audio.src = entry.url;
-      audio.volume = 1.0;
+      // Local handler refs so finish() only nulls handlers if they're
+      // still ours (a later speak may have overwritten them).
+      const onEnded = () => finish(true, "onended");
+      const onError = () => finish(false, "audio-error");
       const finish = (ok, why) => {
         if (done) return;
         done = true;
@@ -1024,15 +1066,17 @@ function useVoicePack(enabled, gender = "female") {
         busyRef.current = false;
         if (cancelCurrentRef.current === thisCancel) cancelCurrentRef.current = null;
         try {
-          audio.onended = null;
-          audio.onerror = null;
+          if (audio.onended === onEnded) audio.onended = null;
+          if (audio.onerror === onError) audio.onerror = null;
         } catch {/* noop */}
-        try {
-          audio.pause();
-        } catch {/* noop */}
-        try {
-          audio.src = "";
-        } catch {/* noop */} // release the blob
+        // Only pause if we're being cancelled / errored mid-flight. On
+        // natural end (onended / duration-timer) the audio has already
+        // stopped, and the next speak will overwrite .src anyway.
+        if (why === "external-cancel" || why === "audio-error") {
+          try {
+            audio.pause();
+          } catch {/* noop */}
+        }
         try {
           resolve(ok);
         } catch {/* noop */}
@@ -1040,9 +1084,10 @@ function useVoicePack(enabled, gender = "female") {
       const thisCancel = () => finish(false, "external-cancel");
       cancelCurrentRef.current = thisCancel;
       busyRef.current = true;
-      audio.onended = () => finish(true, "onended");
-      audio.onerror = () => finish(false, "audio-error");
-
+      audio.onended = onEnded;
+      audio.onerror = onError;
+      audio.src = entry.url;
+      audio.volume = 1.0;
       // Failsafe duration timer — fires if onended doesn't.
       timeoutId = setTimeout(() => finish(true, "duration-timer"), entry.duration * 1000 + 250);
       const p = audio.play();
@@ -1054,12 +1099,13 @@ function useVoicePack(enabled, gender = "female") {
       }
       dlog("log", "audio.play() called, dur=" + entry.duration.toFixed(2));
     });
-  }, [enabled, available, loadBuffer, stopNow]);
+  }, [enabled, available, loadBuffer, stopNow, getAudio]);
   const cancel = useCallback(() => stopNow(), [stopNow]);
   useEffect(() => () => stopNow(), [stopNow]);
   return {
     speak,
     cancel,
+    prime,
     // Pre-warm the buffer for a phrase (fetch + decode) without playing.
     prefetch: async text => {
       try {
@@ -2852,6 +2898,7 @@ function MeditationApp() {
         /* noop */
       }
     }
+    if (prefs.voice) voicePack.prime?.();
     if (prefs.startBell) setTimeout(() => ambient.bell(), 400);
     haptic(20);
 
@@ -2937,6 +2984,7 @@ function MeditationApp() {
     setSessionPhase("practice"); // no intro for quick resets
     setScreen("session");
     ambient.start(cat.toneConfig, prefs.ambient);
+    if (prefs.voice) voicePack.prime?.();
     if (prefs.startBell) setTimeout(() => ambient.bell(), 400);
     if (prefs.voice) setTimeout(() => speak(cat.guidance[0]), 1200);
     haptic(15);
@@ -2960,6 +3008,7 @@ function MeditationApp() {
         /* noop */
       }
     }
+    if (prefs.voice) voicePack.prime?.();
     if (prefs.startBell) setTimeout(() => ambient.bell(), 300);
     if (prefs.voice) setTimeout(() => speak(SOS_OPENING_LINE), 1400);
     haptic([10, 60, 10]);
@@ -2984,6 +3033,7 @@ function MeditationApp() {
         /* noop */
       }
     }
+    if (prefs.voice) voicePack.prime?.();
     if (prefs.startBell) setTimeout(() => ambient.bell(), 300);
     haptic(15);
   };
@@ -3023,6 +3073,7 @@ function MeditationApp() {
         /* noop */
       }
     }
+    if (prefs.voice) voicePack.prime?.();
     if (prefs.startBell) setTimeout(() => ambient.bell(), 300);
     haptic(20);
     // Queue the opening lines, then breath, then intention, then closing
