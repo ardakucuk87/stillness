@@ -1192,11 +1192,13 @@ function useVoiceGuidance(enabled, gender = "female", cuesEnabled = true, manual
   // Full guidance line — cloud TTS preferred, browser fallback.
   const speak = useCallback(async text => {
     if (!enabled || !text) return;
-    // Try the cloud first if it's wired up
+    // If a pack/cloud provider is available, trust it. Falling through to
+    // browser TTS on a `false` return value layers speechSynthesis on top
+    // of any draining pack audio — that was the "two voices over each
+    // other" bug.
     if (cloud?.available) {
-      const ok = await cloud.speak(text);
-      if (ok) return;
-      // fall through to browser TTS on failure
+      await cloud.speak(text);
+      return;
     }
     if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
     try {
@@ -1340,7 +1342,12 @@ function useVoiceGuidance(enabled, gender = "female", cuesEnabled = true, manual
       /* noop */
     }
   }, [cloud]);
-  useEffect(() => () => stopSpeaking(), [stopSpeaking]);
+  // Keep stopSpeaking in a ref so the unmount cleanup doesn't fire every
+  // time `cloud` (and therefore stopSpeaking's identity) changes. That
+  // re-run was cancelling the in-flight line on every parent re-render.
+  const stopSpeakingRef = useRef(stopSpeaking);
+  stopSpeakingRef.current = stopSpeaking;
+  useEffect(() => () => stopSpeakingRef.current(), []);
 
   // Preview an arbitrary voice (by URI) — used by the voice picker so the
   // user can audition a candidate without committing to it.
