@@ -1,0 +1,4661 @@
+<!doctype html>
+<html lang="en"><head><meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no"/>
+<meta name="theme-color" content="#0a0a0f"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="Stillness"/>
+<title>Stillness</title>
+<script type="importmap">{"imports":{"react":"https://esm.sh/react@18.3.1","react/jsx-runtime":"https://esm.sh/react@18.3.1/jsx-runtime","react-dom/client":"https://esm.sh/react-dom@18.3.1/client","tone":"https://esm.sh/tone@15.0.4"}}</script>
+<style>html,body{margin:0;padding:0;background:#0a0a0f}body{color:#fff;font-family:-apple-system,BlinkMacSystemFont,sans-serif}#loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#ffffff45;font-size:12px;letter-spacing:6px;text-transform:uppercase}</style>
+</head><body><div id="root"></div><div id="loading">Stillness · loading</div>
+<script type="module">
+import { createRoot } from "react-dom/client";
+import { jsx } from "react/jsx-runtime";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import * as Tone from "tone";
+
+/* ─── DEBUG LOG ─────────────────────────────────────────────────
+   In-app diagnostic ring-buffer. Captures every voice-pack
+   lifecycle event plus console.warn/error. Surfaces as an overlay
+   the user can toggle on their phone so we don't need DevTools.
+   Take a screenshot of the overlay = a full bug report. */
+import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
+const DEBUG_LOG = [];
+const DEBUG_LISTENERS = new Set();
+function dlog(level, ...args) {
+  const msg = args.map(a => {
+    if (a instanceof Error) return a.message;
+    if (typeof a === "object") {
+      try {
+        return JSON.stringify(a).slice(0, 120);
+      } catch {
+        return String(a);
+      }
+    }
+    return String(a);
+  }).join(" ");
+  const entry = {
+    t: Date.now(),
+    level,
+    msg
+  };
+  DEBUG_LOG.push(entry);
+  if (DEBUG_LOG.length > 100) DEBUG_LOG.shift();
+  DEBUG_LISTENERS.forEach(l => {
+    try {
+      l(entry);
+    } catch {}
+  });
+  if (typeof console !== "undefined") {
+    const fn = console[level] || console.log;
+    fn.call(console, "[stillness]", ...args);
+  }
+}
+// Capture native console warnings/errors so library failures show up too.
+if (typeof window !== "undefined" && !window.__stillnessConsolePatched) {
+  window.__stillnessConsolePatched = true;
+  ["warn", "error"].forEach(level => {
+    const orig = console[level];
+    console[level] = function (...args) {
+      try {
+        const entry = {
+          t: Date.now(),
+          level,
+          msg: args.map(a => a instanceof Error ? a.message : typeof a === "object" ? "[obj]" : String(a)).join(" ")
+        };
+        DEBUG_LOG.push(entry);
+        if (DEBUG_LOG.length > 100) DEBUG_LOG.shift();
+        DEBUG_LISTENERS.forEach(l => {
+          try {
+            l(entry);
+          } catch {}
+        });
+      } catch {}
+      return orig.apply(this, args);
+    };
+  });
+  window.addEventListener("error", e => {
+    dlog("error", "window.error:", e.message || "(no message)");
+  });
+  window.addEventListener("unhandledrejection", e => {
+    dlog("error", "unhandled:", e.reason?.message || String(e.reason || ""));
+  });
+}
+function useDebugLog() {
+  const [entries, setEntries] = useState(() => [...DEBUG_LOG]);
+  useEffect(() => {
+    const listener = () => setEntries([...DEBUG_LOG]);
+    DEBUG_LISTENERS.add(listener);
+    return () => DEBUG_LISTENERS.delete(listener);
+  }, []);
+  return entries;
+}
+
+/* =============================================================
+   Stillness — a mobile-first meditation app
+   Optimized for iPhone (safe areas, wake lock, haptics, PWA-ready)
+   ============================================================= */
+
+// ─── Meditation Data ───────────────────────────────────────────
+const CATEGORIES = [{
+  id: "focus",
+  label: "Focus",
+  icon: "◎",
+  color: "#E8A87C",
+  accent: "#D4956A",
+  description: "Sharpen your attention",
+  guidance: ["Bring your attention to the space between your eyebrows.", "Notice each thought like a cloud passing through a clear sky.", "Let distractions dissolve. Return to your breath.", "Feel your mind becoming still, like the surface of a lake.", "With each exhale, release what no longer serves you.", "You are fully present. Fully here. Fully aware."],
+  breathPattern: {
+    inhale: 4,
+    hold: 4,
+    exhale: 4,
+    holdOut: 0
+  },
+  toneConfig: {
+    note: "C4",
+    fifth: "G4",
+    filterFreq: 800
+  }
+}, {
+  id: "relax",
+  label: "Relax",
+  icon: "〰",
+  color: "#85CDCA",
+  accent: "#6BB5B2",
+  description: "Release and let go",
+  guidance: ["Allow your shoulders to drop away from your ears.", "Feel the weight of your body sinking into the earth.", "With each breath, tension melts like snow in sunlight.", "There is nowhere to go. Nothing to fix. Just this moment.", "Let warmth spread through your chest and into your limbs.", "You are safe. You are held. You are at peace."],
+  breathPattern: {
+    inhale: 4,
+    hold: 2,
+    exhale: 6,
+    holdOut: 2
+  },
+  toneConfig: {
+    note: "G3",
+    fifth: "D4",
+    filterFreq: 600
+  }
+}, {
+  id: "wakeup",
+  label: "Wake Up",
+  icon: "✦",
+  color: "#F6D365",
+  accent: "#E4C255",
+  description: "Energize your morning",
+  guidance: ["Take a deep, expansive breath. Fill your lungs completely.", "Feel energy rising from the base of your spine upward.", "Imagine golden light pouring in through the crown of your head.", "Each inhale brings vitality. Each exhale clears the fog.", "You are awake. You are alive. This day is yours.", "Carry this brightness with you into everything you do."],
+  breathPattern: {
+    inhale: 3,
+    hold: 1,
+    exhale: 3,
+    holdOut: 1
+  },
+  toneConfig: {
+    note: "E4",
+    fifth: "B4",
+    filterFreq: 1200
+  }
+}, {
+  id: "winddown",
+  label: "Wind Down",
+  icon: "◐",
+  color: "#C3A6D8",
+  accent: "#A98CC4",
+  description: "Transition to stillness",
+  guidance: ["Let the events of the day begin to fade behind you.", "With each breath, the world becomes a little quieter.", "Feel the gentle pull of gravity inviting you to rest.", "Release the stories of today. They will wait for tomorrow.", "Your breath slows. Your heart settles. Your mind softens.", "You have done enough. It is time to simply be."],
+  breathPattern: {
+    inhale: 4,
+    hold: 3,
+    exhale: 6,
+    holdOut: 3
+  },
+  toneConfig: {
+    note: "A3",
+    fifth: "E4",
+    filterFreq: 500
+  }
+}, {
+  id: "sleep",
+  label: "Sleep",
+  icon: "☾",
+  color: "#7B8CDE",
+  accent: "#6374C8",
+  description: "Drift into deep rest",
+  guidance: ["Close your eyes and let darkness become your friend.", "Feel your body becoming heavier with each slow breath.", "Imagine floating on a warm, still ocean under the stars.", "Every muscle releases. Every thought dissolves into silence.", "You are drifting… gently… softly… into deep rest.", "Sleep is here. Let it carry you. Let go completely."],
+  breathPattern: {
+    inhale: 4,
+    hold: 4,
+    exhale: 8,
+    holdOut: 4
+  },
+  toneConfig: {
+    note: "D3",
+    fifth: "A3",
+    filterFreq: 350
+  }
+}, {
+  id: "stress",
+  label: "Stress Relief",
+  icon: "❋",
+  color: "#E07A7A",
+  accent: "#C96666",
+  description: "Ground and recenter",
+  guidance: ["Place both feet flat. Feel the ground beneath you.", "Name five things you can see. Four you can hear.", "Breathe in calm. Breathe out tension. Feel the difference.", "Your body knows how to heal. Trust it. Let it work.", "The storm inside is passing. You are the sky, not the weather.", "You are stronger than this moment. And this moment will pass."],
+  breathPattern: {
+    inhale: 5,
+    hold: 2,
+    exhale: 7,
+    holdOut: 2
+  },
+  toneConfig: {
+    note: "F3",
+    fifth: "C4",
+    filterFreq: 450
+  }
+}, {
+  id: "bodyscan",
+  label: "Body Scan",
+  icon: "◈",
+  color: "#A8C4A2",
+  accent: "#8FAE89",
+  description: "Head-to-toe awareness",
+  guidance: ["Bring your attention to the crown of your head. Notice any sensation.", "Soften the muscles of your face. The jaw. The space between the eyebrows.", "Let your shoulders drop. Feel the weight of your arms.", "Notice your chest rising and falling. The space inside the ribs.", "Feel your belly soften with each exhale. Let it be heavy.", "Bring awareness to your hips and lower back. Release what is held.", "Move down through the thighs, the knees, the calves.", "Feel your feet — the heels, the arches, each toe.", "Now sense the body as a whole. One continuous field of awareness."],
+  breathPattern: {
+    inhale: 4,
+    hold: 2,
+    exhale: 6,
+    holdOut: 0
+  },
+  toneConfig: {
+    note: "E3",
+    fifth: "B3",
+    filterFreq: 520
+  }
+}];
+const DURATIONS = [{
+  label: "3 min",
+  seconds: 180
+}, {
+  label: "5 min",
+  seconds: 300
+}, {
+  label: "10 min",
+  seconds: 600
+}, {
+  label: "15 min",
+  seconds: 900
+}, {
+  label: "20 min",
+  seconds: 1200
+}, {
+  label: "30 min",
+  seconds: 1800
+}];
+
+// Quick reset durations available right from the home screen
+const QUICK_DURATIONS = [{
+  label: "1 min",
+  seconds: 60
+}, {
+  label: "3 min",
+  seconds: 180
+}];
+
+// ─── Breathwork ────────────────────────────────────────────────
+// Standalone breathing techniques — pure breath practice with a
+// big counter, no rotating guidance text, no per-category intro.
+const BREATHWORK = [{
+  id: "box",
+  label: "Box Breathing",
+  icon: "□",
+  color: "#88AED0",
+  accent: "#6E96BD",
+  short: "4·4·4·4 — Navy SEAL reset",
+  description: "Equal inhale, hold, exhale, hold. A reliable way to steady the nervous system before stress, sleep, or focus.",
+  pattern: {
+    inhale: 4,
+    hold: 4,
+    exhale: 4,
+    holdOut: 4
+  },
+  toneConfig: {
+    note: "G3",
+    fifth: "D4",
+    filterFreq: 600
+  },
+  defaultMinutes: 3
+}, {
+  id: "478",
+  label: "4-7-8",
+  icon: "◇",
+  color: "#9B8FD8",
+  accent: "#8077C0",
+  short: "Calming · sleep",
+  description: "Inhale 4, hold 7, exhale 8. Dr. Weil's classic technique — extended exhale activates the parasympathetic nervous system.",
+  pattern: {
+    inhale: 4,
+    hold: 7,
+    exhale: 8,
+    holdOut: 0
+  },
+  toneConfig: {
+    note: "D3",
+    fifth: "A3",
+    filterFreq: 400
+  },
+  defaultMinutes: 3
+}, {
+  id: "coherent",
+  label: "Coherent (5·5)",
+  icon: "◯",
+  color: "#7FB89E",
+  accent: "#669F86",
+  short: "Heart-rate variability",
+  description: "Five seconds in, five seconds out — about six breaths per minute. The breath rate research links to highest HRV.",
+  pattern: {
+    inhale: 5,
+    hold: 0,
+    exhale: 5,
+    holdOut: 0
+  },
+  toneConfig: {
+    note: "F3",
+    fifth: "C4",
+    filterFreq: 550
+  },
+  defaultMinutes: 5
+}, {
+  id: "triangle",
+  label: "Triangle (3·3·3)",
+  icon: "△",
+  color: "#E4B583",
+  accent: "#CB9C6E",
+  short: "Gentle reset",
+  description: "Inhale 3, hold 3, exhale 3. A gentler entry point if longer holds feel like a strain.",
+  pattern: {
+    inhale: 3,
+    hold: 3,
+    exhale: 3,
+    holdOut: 0
+  },
+  toneConfig: {
+    note: "A3",
+    fifth: "E4",
+    filterFreq: 700
+  },
+  defaultMinutes: 3
+}, {
+  id: "sigh",
+  label: "Physiological Sigh",
+  icon: "≈",
+  color: "#D89BB5",
+  accent: "#BF829C",
+  short: "Two-stage inhale · long exhale",
+  description: "Double inhale through the nose, then a long exhale through the mouth. The fastest known way to lower acute stress in real time.",
+  // Special pattern: two inhales handled in player as a custom phase set.
+  pattern: {
+    inhale: 2,
+    inhale2: 1,
+    exhale: 6,
+    holdOut: 0
+  },
+  custom: "sigh",
+  toneConfig: {
+    note: "E3",
+    fifth: "B3",
+    filterFreq: 500
+  },
+  defaultMinutes: 2
+}];
+
+// ─── Focus Mode ────────────────────────────────────────────────
+// Voice-free ambient soundscape, optional Pomodoro-style cadence.
+const FOCUS_PRESETS = [{
+  id: "deep",
+  label: "Deep Work",
+  icon: "✚",
+  color: "#7FA8C9",
+  description: "25 min focus · 5 min break · repeat",
+  focusMin: 25,
+  breakMin: 5,
+  repeat: true,
+  soundscape: "rain",
+  note: "F2",
+  fifth: "C3",
+  filterFreq: 280
+}, {
+  id: "flow",
+  label: "Flow",
+  icon: "↝",
+  color: "#9DB58D",
+  description: "50 min focus · 10 min break · repeat",
+  focusMin: 50,
+  breakMin: 10,
+  repeat: true,
+  soundscape: "ocean",
+  note: "D2",
+  fifth: "A2",
+  filterFreq: 240
+}, {
+  id: "ambient",
+  label: "Just Ambient",
+  icon: "◌",
+  color: "#B4A4D0",
+  description: "Pure soundscape · 60 min",
+  focusMin: 60,
+  breakMin: 0,
+  repeat: false,
+  soundscape: "none",
+  note: "G2",
+  fifth: "D3",
+  filterFreq: 320
+}];
+
+// ─── Wake Up Routine ───────────────────────────────────────────
+// ~4 min chained morning sequence: bell → opening voice → energizing
+// breath → intention prompt → closing bell. Played as a scripted timeline.
+const WAKE_UP_COLOR = "#F6D365";
+const WAKE_UP_SEQUENCE = {
+  id: "wakeup-routine",
+  label: "Wake Up",
+  icon: "☼",
+  color: WAKE_UP_COLOR,
+  accent: "#E4C255",
+  description: "A 4-minute morning ritual",
+  toneConfig: {
+    note: "E4",
+    fifth: "B4",
+    filterFreq: 1200
+  },
+  // Segments are timed in seconds from t=0.
+  // Voice lines play at their start time; breath cycles run between t=t1..t2.
+  totalSeconds: 240,
+  openingLines: [{
+    text: "Good morning. Let's begin slowly.",
+    pauseAfter: 2
+  }, {
+    text: "Take a moment to notice that you are here. Awake. Alive.",
+    pauseAfter: 3
+  }, {
+    text: "Take a deep breath in through the nose…",
+    pauseAfter: 4
+  }, {
+    text: "And a long breath out through the mouth.",
+    pauseAfter: 4
+  }, {
+    text: "Two more like that, in your own time.",
+    pauseAfter: 12
+  }],
+  bridge: [{
+    text: "Now we'll take eight slower, steadier breaths together.",
+    pauseAfter: 3
+  }, {
+    text: "Follow the circle.",
+    pauseAfter: 2
+  }],
+  // Energizing breath: 3s in, 1s hold, 3s out, 1s hold-out (~8 cycles ≈ 64s)
+  breathPattern: {
+    inhale: 3,
+    hold: 1,
+    exhale: 3,
+    holdOut: 1
+  },
+  breathCycles: 8,
+  intentionLines: [{
+    text: "Before you go, take a moment to set an intention for today.",
+    pauseAfter: 3
+  }, {
+    text: "One word. One feeling. One small thing you'd like to carry with you.",
+    pauseAfter: 8
+  }, {
+    text: "Let it land. There's no need to grip it tightly.",
+    pauseAfter: 5
+  }],
+  closingLines: [{
+    text: "When you're ready, take one final deep breath…",
+    pauseAfter: 4
+  }, {
+    text: "And slowly, gently, open your eyes.",
+    pauseAfter: 3
+  }, {
+    text: "Have a beautiful day.",
+    pauseAfter: 2
+  }]
+};
+
+// ─── SOS preset ────────────────────────────────────────────────
+// One-tap panic mode → 3 minutes of box breathing with a single
+// reassuring opening line and no intro/closing scripts.
+const SOS_TECHNIQUE = BREATHWORK[0]; // Box breathing
+const SOS_OPENING_LINE = "You're okay. We're going to breathe together, slowly. Just follow the circle.";
+const SOS_DURATION_SECONDS = 180;
+const AMBIENT_BEDS = [{
+  id: "none",
+  label: "Drone only"
+}, {
+  id: "rain",
+  label: "Soft rain"
+}, {
+  id: "ocean",
+  label: "Ocean swells"
+}];
+
+// ─── Headspace-style settle-in & wind-down scripts ─────────────
+// Each line is { text, pauseAfter } — pauseAfter is added on top of the
+// natural speaking time so breath has room to land.
+const INTRO_SCRIPT = [{
+  text: "Welcome. Take a moment to find a comfortable position.",
+  pauseAfter: 2.5
+}, {
+  text: "Feet flat on the floor, hands resting gently in your lap.",
+  pauseAfter: 3
+}, {
+  text: "With your eyes open, take a slow, deep breath in through the nose.",
+  pauseAfter: 3.5
+}, {
+  text: "And a long, soft breath out through the mouth.",
+  pauseAfter: 3.5
+}, {
+  text: "Let's take two more like that, at your own pace.",
+  pauseAfter: 8
+}, {
+  text: "On the next exhale, allow your eyes to gently close.",
+  pauseAfter: 4
+}, {
+  text: "Notice any sounds around you. The ones close by, and the ones further away.",
+  pauseAfter: 5
+}, {
+  text: "And now, allow your breath to settle into its natural rhythm.",
+  pauseAfter: 3
+}];
+const CLOSING_SCRIPT = [{
+  text: "Begin to bring your awareness back to your body.",
+  pauseAfter: 3
+}, {
+  text: "Feel your hands resting, your feet on the floor.",
+  pauseAfter: 3
+}, {
+  text: "Slowly, when you're ready, wiggle your fingers and your toes.",
+  pauseAfter: 4
+}, {
+  text: "And gently, in your own time, allow your eyes to open.",
+  pauseAfter: 3
+}];
+
+// Bridge line spoken once at the very end of the intro to set the tone
+// for each specific practice. Added to category records below.
+const CATEGORY_INTRO_BRIDGE = {
+  focus: "For the next few minutes, we'll work on bringing the mind to a single point of focus.",
+  relax: "For the next few minutes, simply allow the body and mind to soften.",
+  wakeup: "For the next few minutes, we'll invite a sense of brightness and energy into the body.",
+  winddown: "For the next few minutes, let everything begin to slow.",
+  sleep: "For the next few minutes, let the body grow heavy and the mind grow quiet.",
+  stress: "For the next few minutes, we'll find solid ground beneath the noise.",
+  bodyscan: "For the next few minutes, we'll move slowly through the body, noticing what's there without changing it."
+};
+const MOODS = [{
+  emoji: "🌿",
+  label: "Calmer"
+}, {
+  emoji: "✨",
+  label: "Brighter"
+}, {
+  emoji: "💧",
+  label: "Tender"
+}, {
+  emoji: "🪨",
+  label: "Grounded"
+}, {
+  emoji: "🌙",
+  label: "Sleepy"
+}];
+const DEFAULT_PREFS = {
+  haptics: true,
+  voice: true,
+  // spoken guidance lines
+  breathCues: true,
+  // spoken "breathe in / hold / breathe out" on each phase
+  voiceGender: "female",
+  // "female" | "male" | "system"
+  manualVoiceURI: null,
+  // if set, overrides the auto-picker entirely
+  // Cloud TTS (OpenAI) — vastly better than browser voices on iOS
+  cloudTTS: false,
+  // enabled when user pastes a key
+  openAIKey: "",
+  // user-provided, stored in localStorage
+  cloudVoice: "nova",
+  // best for meditation
+  startBell: true,
+  endBell: true,
+  intervalBell: 0,
+  // 0 = off, otherwise minutes between bells
+  ambient: "none",
+  reducedMotion: false // honors system pref too
+};
+const PREFS_KEY = "stillness.prefs.v1";
+const STATS_KEY = "stillness.stats.v1";
+const HISTORY_KEY = "stillness.history.v1";
+
+// ─── Local storage helpers (safe-guarded for sandboxes) ────────
+const safeStorage = {
+  get(key, fallback) {
+    try {
+      if (typeof window === "undefined" || !window.localStorage) return fallback;
+      const raw = window.localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch {
+      return fallback;
+    }
+  },
+  set(key, value) {
+    try {
+      if (typeof window === "undefined" || !window.localStorage) return;
+      window.localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      /* noop */
+    }
+  }
+};
+
+// ─── IndexedDB cache for cloud TTS audio ───────────────────────
+// Each MP3 is cached by a key derived from the text + voice + model so
+// repeat sessions are free. The cache is opened lazily.
+const TTS_DB = "stillness-tts";
+const TTS_STORE = "audio";
+function openTTSDB() {
+  if (typeof indexedDB === "undefined") return Promise.reject(new Error("no idb"));
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(TTS_DB, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(TTS_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function ttsCacheGet(key) {
+  try {
+    const db = await openTTSDB();
+    return await new Promise(resolve => {
+      const tx = db.transaction(TTS_STORE, "readonly");
+      const r = tx.objectStore(TTS_STORE).get(key);
+      r.onsuccess = () => resolve(r.result || null);
+      r.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+async function ttsCachePut(key, blob) {
+  try {
+    const db = await openTTSDB();
+    await new Promise(resolve => {
+      const tx = db.transaction(TTS_STORE, "readwrite");
+      tx.objectStore(TTS_STORE).put(blob, key);
+      tx.oncomplete = resolve;
+      tx.onerror = resolve;
+    });
+  } catch {
+    /* noop */
+  }
+}
+async function ttsCacheKey(text, voice, model) {
+  const enc = new TextEncoder().encode(`${model}|${voice}|${text}`);
+  const buf = await crypto.subtle.digest("SHA-256", enc);
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ─── Cloud TTS Voices ──────────────────────────────────────────
+// Curated subset of OpenAI's voices — the ones that actually sound
+// like meditation teachers. Skipping Fable (British storytelling tone)
+// and Alloy (too newsy) for our use case.
+const CLOUD_VOICES = [{
+  id: "nova",
+  label: "Nova",
+  gender: "female",
+  note: "Warm, calming · best for meditation"
+}, {
+  id: "shimmer",
+  label: "Shimmer",
+  gender: "female",
+  note: "Soft, gentle"
+}, {
+  id: "onyx",
+  label: "Onyx",
+  gender: "male",
+  note: "Deep, grounded"
+}, {
+  id: "echo",
+  label: "Echo",
+  gender: "male",
+  note: "Warm, neutral"
+}, {
+  id: "alloy",
+  label: "Alloy",
+  gender: "neutral",
+  note: "Clear, neutral"
+}, {
+  id: "fable",
+  label: "Fable",
+  gender: "male",
+  note: "British, storytelling"
+}];
+const CLOUD_TTS_MODEL = "tts-1-hd";
+const CLOUD_TTS_URL = "https://api.openai.com/v1/audio/speech";
+
+// ─── Hooks ─────────────────────────────────────────────────────
+function usePersistedState(key, initial) {
+  const [value, setValue] = useState(() => safeStorage.get(key, initial));
+  useEffect(() => {
+    safeStorage.set(key, value);
+  }, [key, value]);
+  return [value, setValue];
+}
+function usePrefersReducedMotion() {
+  const [reduced, setReduced] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const onChange = () => setReduced(mq.matches);
+    onChange();
+    mq.addEventListener?.("change", onChange);
+    return () => mq.removeEventListener?.("change", onChange);
+  }, []);
+  return reduced;
+}
+function useWakeLock(active) {
+  const sentinelRef = useRef(null);
+  const acquire = useCallback(async () => {
+    try {
+      if (!("wakeLock" in navigator)) return;
+      sentinelRef.current = await navigator.wakeLock.request("screen");
+      sentinelRef.current.addEventListener?.("release", () => {
+        sentinelRef.current = null;
+      });
+    } catch {
+      /* user may have denied or feature missing */
+    }
+  }, []);
+  const release = useCallback(async () => {
+    try {
+      await sentinelRef.current?.release();
+    } catch {
+      /* noop */
+    } finally {
+      sentinelRef.current = null;
+    }
+  }, []);
+  useEffect(() => {
+    if (active) acquire();else release();
+    const onVis = () => {
+      if (active && document.visibilityState === "visible" && !sentinelRef.current) {
+        acquire();
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      release();
+    };
+  }, [active, acquire, release]);
+}
+function useHaptics(enabled) {
+  return useCallback((pattern = 12) => {
+    if (!enabled) return;
+    try {
+      navigator.vibrate?.(pattern);
+    } catch {
+      /* iOS Safari ignores; that's fine */
+    }
+  }, [enabled]);
+}
+
+// Pick the calmest, most natural-sounding voice available.
+// iOS Safari exposes "Samantha", "Ava (Enhanced)", "Allison", "Daniel", "Tom", etc.
+// We prefer voices flagged Premium/Enhanced/Neural, then named favorites.
+const FEMALE_VOICE_NAMES = ["Ava", "Samantha", "Allison", "Susan", "Karen", "Serena", "Moira", "Tessa", "Google US English", "Microsoft Aria Online"];
+const MALE_VOICE_NAMES = ["Daniel", "Tom", "Aaron", "Arthur", "Oliver", "Reed", "Rishi", "Microsoft Guy Online"];
+
+// Score a voice for meditation use. Higher = better.
+// Heuristics: Premium/Neural > Enhanced > basic; preferred named voices win
+// ties; US English wins; "novelty" voices (Albert, Bahh, Bells, Bubbles, Cellos,
+// Deranged, Good News, Hysterical, Jester, Organ, Trinoids, Whisper, Zarvox)
+// are penalized hard so they never win.
+const NOVELTY_RX = /(Albert|Bahh|Bells|Bubbles|Cellos|Deranged|Good News|Hysterical|Jester|Organ|Trinoids|Whisper|Zarvox|Bad News|Boing|Bruce|Junior|Kathy|Pipe|Princess|Ralph|Wobble|Fred|Grandma|Grandpa|Rocko|Sandy|Shelley|Flo|Eddy|Reed|Sandy)/i;
+function scoreVoice(v, preferredNames) {
+  let score = 0;
+  if (/Premium/i.test(v.name)) score += 1000;else if (/Neural/i.test(v.name)) score += 900;else if (/Enhanced/i.test(v.name)) score += 500;
+  if (/Online/i.test(v.name)) score += 300; // cloud voices on Android/Windows
+  for (let i = 0; i < preferredNames.length; i++) {
+    if (v.name.includes(preferredNames[i])) {
+      score += 200 - i * 10;
+      break;
+    }
+  }
+  if (/^en-US/i.test(v.lang)) score += 50;else if (/^en-GB/i.test(v.lang)) score += 30;
+  if (v.default) score += 10;
+  if (NOVELTY_RX.test(v.name)) score -= 5000; // never pick joke voices
+  return score;
+}
+function pickVoice(voices, gender, manualURI) {
+  if (!voices || !voices.length) return null;
+
+  // 0. Manual override — user explicitly chose this voice.
+  if (manualURI) {
+    const m = voices.find(v => v.voiceURI === manualURI);
+    if (m) return m;
+  }
+  const english = voices.filter(v => /^en[-_]/i.test(v.lang));
+  const pool = english.length ? english : voices;
+  if (gender === "system") return null;
+  const preferred = gender === "male" ? MALE_VOICE_NAMES : FEMALE_VOICE_NAMES;
+
+  // Score every voice and pick the best. This is more robust than the
+  // old "match first preferred name" approach because it actually ranks
+  // Premium > Enhanced > basic even when names overlap.
+  let best = null;
+  let bestScore = -Infinity;
+  for (const v of pool) {
+    const s = scoreVoice(v, preferred);
+    if (s > bestScore) {
+      bestScore = s;
+      best = v;
+    }
+  }
+  if (best && bestScore > 0) return best;
+
+  // 1. Premium/Enhanced/Neural match by preferred name
+  for (const name of preferred) {
+    const v = pool.find(vv => vv.name.includes(name) && /(Enhanced|Premium|Neural|Online)/i.test(vv.name));
+    if (v) return v;
+  }
+  // 2. Plain name match
+  for (const name of preferred) {
+    const v = pool.find(vv => vv.name.includes(name));
+    if (v) return v;
+  }
+  // 3. Any English Enhanced/Premium voice
+  const anyPremium = pool.find(v => /(Enhanced|Premium|Neural)/i.test(v.name));
+  if (anyPremium) return anyPremium;
+  // 4. Local English default
+  return pool.find(v => v.default) || pool[0] || null;
+}
+function useVoices() {
+  const [voices, setVoices] = useState([]);
+  useEffect(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    const load = () => {
+      try {
+        const list = window.speechSynthesis.getVoices();
+        if (list && list.length) setVoices(list);
+      } catch {
+        /* noop */
+      }
+    };
+    load();
+    window.speechSynthesis.addEventListener?.("voiceschanged", load);
+    // iOS Safari sometimes needs a kick
+    const t = setTimeout(load, 400);
+    return () => {
+      clearTimeout(t);
+      window.speechSynthesis.removeEventListener?.("voiceschanged", load);
+    };
+  }, []);
+  return voices;
+}
+
+// Cache-buster baked into the HTML at build time. When this changes,
+// all voice-pack URLs get a new query param, so browsers that cached
+// old 404s for missing files refetch fresh.
+const VOICE_PACK_VERSION = "v5";
+
+// Local voice pack — pre-generated MP3s hosted alongside the app.
+// Files live at /voices/{gender}/{sha256(text).slice(0,16)}.mp3 — same
+// hashing scheme as the generate-voices.mjs script. On first call we
+// probe one known file to detect whether the pack is present, then cache
+// hits/misses to avoid hammering 404s.
+async function sha256Short(text) {
+  const enc = new TextEncoder().encode(text);
+  const buf = await crypto.subtle.digest("SHA-256", enc);
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+function useVoicePack(enabled, gender = "female") {
+  // ONE NEW Audio element PER SPEAK CALL. Each speak owns its own
+  // closure with private timer, handlers, and audio element. Previous
+  // speak is cancelled via a shared cancel ref. No shared mutable
+  // state between concurrent calls — that was causing "2 voices
+  // overlapping" because state from one speak was leaking into another.
+  const cacheRef = useRef(new Map()); // hash -> { url, duration }
+  const inflightRef = useRef(new Map()); // hash -> Promise<entry>
+  const missCacheRef = useRef(new Set());
+  const cancelCurrentRef = useRef(null); // cancel fn for current play
+  const busyRef = useRef(false);
+  const [available, setAvailable] = useState(null);
+
+  // Probe whether the voice pack exists. Uses GET (HEAD can be flaky on
+  // some Netlify edge configurations) on "Breathe in", which the
+  // generator always produces.
+  useEffect(() => {
+    if (!enabled || available !== null) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const h = await sha256Short("Breathe in");
+        const probeUrl = `./voices/${gender}/${h}.mp3?${VOICE_PACK_VERSION}`;
+        dlog("log", "voicepack: probing " + probeUrl);
+        const res = await fetch(probeUrl, {
+          cache: "default"
+        });
+        dlog("log", "voicepack: probe status=" + res.status + " ok=" + res.ok);
+        if (!cancelled) setAvailable(res.ok);
+      } catch (e) {
+        dlog("error", "voicepack: probe threw", e);
+        if (!cancelled) setAvailable(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled, gender, available]);
+
+  // No shared audio element — each speak creates its own.
+
+  // Load an MP3, cache its blob URL + duration. Decoding is done once
+  // just to learn duration; we discard the AudioBuffer immediately.
+  const loadBuffer = useCallback(async text => {
+    if (!text) return null;
+    const h = await sha256Short(text);
+    const cached = cacheRef.current.get(h);
+    if (cached) return cached;
+    if (missCacheRef.current.has(text)) return null;
+    let inflight = inflightRef.current.get(h);
+    if (inflight) return inflight;
+    inflight = (async () => {
+      try {
+        const url = `./voices/${gender}/${h}.mp3?${VOICE_PACK_VERSION}`;
+        dlog("log", "load:", text.slice(0, 30));
+        const res = await fetch(url, {
+          cache: "default"
+        });
+        if (!res.ok) {
+          dlog("warn", "load: 404 for", text.slice(0, 30));
+          missCacheRef.current.add(text);
+          return null;
+        }
+        const blob = await res.blob();
+        dlog("log", "fetched", blob.size, "bytes");
+
+        // Decode briefly just to know duration (we don't keep the buffer).
+        let duration = 0;
+        try {
+          const arrayBuffer = await blob.arrayBuffer();
+          await Tone.start();
+          const ctx = Tone.getContext().rawContext;
+          const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
+          duration = audioBuffer.duration;
+          dlog("log", "decoded", duration.toFixed(2) + "s");
+        } catch (e) {
+          dlog("warn", "decode failed, falling back to 8s default:", e);
+          duration = 8; // fallback if decode fails
+        }
+        const objUrl = URL.createObjectURL(blob);
+        const entry = {
+          url: objUrl,
+          duration
+        };
+        cacheRef.current.set(h, entry);
+        return entry;
+      } catch (e) {
+        dlog("error", "load failed:", text.slice(0, 30), e);
+        missCacheRef.current.add(text);
+        return null;
+      } finally {
+        inflightRef.current.delete(h);
+      }
+    })();
+    inflightRef.current.set(h, inflight);
+    return inflight;
+  }, [gender]);
+
+  // Cancel whatever's currently playing by calling its own cancel fn.
+  const stopNow = useCallback(() => {
+    busyRef.current = false;
+    const c = cancelCurrentRef.current;
+    cancelCurrentRef.current = null;
+    if (c) {
+      try {
+        c();
+      } catch {/* noop */}
+    }
+  }, []);
+  const speak = useCallback(async text => {
+    if (!enabled || available !== true || !text) return false;
+    dlog("log", "speak: start", text.slice(0, 30));
+    let entry;
+    try {
+      entry = await loadBuffer(text);
+    } catch (e) {
+      dlog("error", "speak: load threw", e);
+      return false;
+    }
+    if (!entry) return false;
+
+    // Cancel any previous speak BEFORE creating a new audio element.
+    stopNow();
+    return await new Promise(resolve => {
+      // Everything below is private to THIS speak call. Each gets its
+      // own Audio, its own timer, its own done flag, its own finish.
+      let done = false;
+      let timeoutId = null;
+      const audio = new Audio();
+      audio.preload = "auto";
+      audio.playsInline = true;
+      audio.src = entry.url;
+      audio.volume = 1.0;
+      const finish = (ok, why) => {
+        if (done) return;
+        done = true;
+        dlog("log", "speak: finish ok=" + ok + " (" + why + ")");
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        busyRef.current = false;
+        if (cancelCurrentRef.current === thisCancel) cancelCurrentRef.current = null;
+        try {
+          audio.onended = null;
+          audio.onerror = null;
+        } catch {/* noop */}
+        try {
+          audio.pause();
+        } catch {/* noop */}
+        try {
+          audio.src = "";
+        } catch {/* noop */} // release the blob
+        try {
+          resolve(ok);
+        } catch {/* noop */}
+      };
+      const thisCancel = () => finish(false, "external-cancel");
+      cancelCurrentRef.current = thisCancel;
+      busyRef.current = true;
+      audio.onended = () => finish(true, "onended");
+      audio.onerror = () => finish(false, "audio-error");
+
+      // Failsafe duration timer — fires if onended doesn't.
+      timeoutId = setTimeout(() => finish(true, "duration-timer"), entry.duration * 1000 + 250);
+      const p = audio.play();
+      if (p && p.catch) {
+        p.catch(e => {
+          dlog("error", "audio.play() rejected:", e?.message || e);
+          // Don't fail — duration timer catches us either way.
+        });
+      }
+      dlog("log", "audio.play() called, dur=" + entry.duration.toFixed(2));
+    });
+  }, [enabled, available, loadBuffer, stopNow]);
+  const cancel = useCallback(() => stopNow(), [stopNow]);
+  useEffect(() => () => stopNow(), [stopNow]);
+  return {
+    speak,
+    cancel,
+    // Pre-warm the buffer for a phrase (fetch + decode) without playing.
+    prefetch: async text => {
+      try {
+        await loadBuffer(text);
+      } catch {/* noop */}
+    },
+    isBusy: () => busyRef.current,
+    available: !!(enabled && available === true),
+    detected: available
+  };
+}
+
+// Cloud TTS player. Holds a single Audio element, queues utterances, and
+// caches blobs. Returns a `speak(text)` that resolves after playback,
+// `cancel()` that aborts everything, and `prefetch(text)` that warms
+// the cache without playing.
+function useCloudTTS(enabled, apiKey, voice) {
+  const audioRef = useRef(null);
+  const cancelledRef = useRef(false);
+  const objectUrlRef = useRef(null);
+  const busyRef = useRef(false);
+  const resolverRef = useRef(null);
+  const cleanup = useCallback(() => {
+    if (resolverRef.current) {
+      try {
+        resolverRef.current(false);
+      } catch {/* noop */}
+      resolverRef.current = null;
+    }
+    busyRef.current = false;
+    try {
+      audioRef.current?.pause();
+      audioRef.current = null;
+    } catch {
+      /* noop */
+    }
+    if (objectUrlRef.current) {
+      try {
+        URL.revokeObjectURL(objectUrlRef.current);
+      } catch {
+        /* noop */
+      }
+      objectUrlRef.current = null;
+    }
+  }, []);
+  const fetchBlob = useCallback(async text => {
+    const key = await ttsCacheKey(text, voice, CLOUD_TTS_MODEL);
+    const cached = await ttsCacheGet(key);
+    if (cached) return cached;
+    const res = await fetch(CLOUD_TTS_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: CLOUD_TTS_MODEL,
+        voice: voice,
+        input: text,
+        response_format: "mp3",
+        speed: 0.92 // slightly slower than default for meditation pacing
+      })
+    });
+    if (!res.ok) {
+      const err = await res.text().catch(() => "");
+      throw new Error(`OpenAI TTS ${res.status}: ${err.slice(0, 120)}`);
+    }
+    const blob = await res.blob();
+    // Don't await the cache write — let it persist in the background.
+    ttsCachePut(key, blob);
+    return blob;
+  }, [apiKey, voice]);
+  const speak = useCallback(async text => {
+    if (!enabled || !apiKey || !voice || !text) return false;
+    try {
+      cancelledRef.current = false;
+      const blob = await fetchBlob(text);
+      if (cancelledRef.current) return false;
+      cleanup();
+      const url = URL.createObjectURL(blob);
+      objectUrlRef.current = url;
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      audio.volume = 0.95;
+      busyRef.current = true;
+      await audio.play();
+      return await new Promise(resolve => {
+        resolverRef.current = resolve;
+        const finish = ok => {
+          busyRef.current = false;
+          if (resolverRef.current === resolve) {
+            resolverRef.current = null;
+            resolve(ok);
+          }
+        };
+        audio.onended = () => finish(true);
+        audio.onerror = () => finish(false);
+      });
+    } catch (e) {
+      busyRef.current = false;
+      console.warn("Cloud TTS failed:", e);
+      return false;
+    }
+  }, [enabled, apiKey, voice, fetchBlob, cleanup]);
+  const prefetch = useCallback(async text => {
+    if (!enabled || !apiKey || !voice || !text) return;
+    try {
+      await fetchBlob(text);
+    } catch {
+      /* noop */
+    }
+  }, [enabled, apiKey, voice, fetchBlob]);
+  const cancel = useCallback(() => {
+    cancelledRef.current = true;
+    cleanup();
+  }, [cleanup]);
+  useEffect(() => cleanup, [cleanup]);
+  return {
+    speak,
+    prefetch,
+    cancel,
+    isBusy: () => busyRef.current,
+    available: !!(enabled && apiKey)
+  };
+}
+function useVoiceGuidance(enabled, gender = "female", cuesEnabled = true, manualURI = null, cloud = null) {
+  const voices = useVoices();
+  const chosenVoice = useMemo(() => pickVoice(voices, gender, manualURI), [voices, gender, manualURI]);
+
+  // Full guidance line — cloud TTS preferred, browser fallback.
+  const speak = useCallback(async text => {
+    if (!enabled || !text) return;
+    // Try the cloud first if it's wired up
+    if (cloud?.available) {
+      const ok = await cloud.speak(text);
+      if (ok) return;
+      // fall through to browser TTS on failure
+    }
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      if (chosenVoice) u.voice = chosenVoice;
+      u.rate = 0.78;
+      u.pitch = 0.95;
+      u.volume = 0.85;
+      u.lang = chosenVoice?.lang || "en-US";
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(u);
+    } catch {
+      /* noop */
+    }
+  }, [enabled, chosenVoice, cloud]);
+
+  // Short breath cue — uses cloud if available (cached after first session),
+  // otherwise browser TTS at lower volume.
+  const speakCue = useCallback(async text => {
+    if (!cuesEnabled || !text) return;
+    if (cloud?.available) {
+      // Cloud / voice-pack audio is exclusive — only one Audio element
+      // plays at a time. If a guidance line (or a previous cue) is still
+      // playing, skip this cue rather than chopping it off mid-sentence.
+      if (cloud.isBusy?.()) return;
+      await cloud.speak(text);
+      return;
+    }
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    try {
+      if (window.speechSynthesis.speaking || window.speechSynthesis.pending) return;
+      const u = new SpeechSynthesisUtterance(text);
+      if (chosenVoice) u.voice = chosenVoice;
+      u.rate = 0.7;
+      u.pitch = 0.92;
+      u.volume = 0.55;
+      u.lang = chosenVoice?.lang || "en-US";
+      window.speechSynthesis.speak(u);
+    } catch {
+      /* noop */
+    }
+  }, [cuesEnabled, chosenVoice, cloud]);
+
+  // Sequence player — queues lines with onend handlers so each line waits
+  // for the prior to finish, then adds a pause before the next. Returns a
+  // cancellation handle so we can bail out cleanly if the user stops.
+  const sequenceRef = useRef({
+    cancelled: false,
+    timeout: null
+  });
+  const speakSequence = useCallback((lines, onDone) => {
+    if (!enabled || typeof window === "undefined" || !("speechSynthesis" in window) || !lines?.length) {
+      onDone?.();
+      return () => {};
+    }
+
+    // Cancel any existing sequence first
+    try {
+      sequenceRef.current.cancelled = true;
+      if (sequenceRef.current.timeout) clearTimeout(sequenceRef.current.timeout);
+      window.speechSynthesis.cancel();
+    } catch {
+      /* noop */
+    }
+    const handle = {
+      cancelled: false,
+      timeout: null
+    };
+    sequenceRef.current = handle;
+    let i = 0;
+
+    // Pre-warm the cloud cache for all upcoming lines in the background
+    // so playback is snappy.
+    if (cloud?.available) {
+      for (const {
+        text
+      } of lines) cloud.prefetch?.(text);
+    }
+    const playNext = async () => {
+      if (handle.cancelled) return;
+      if (i >= lines.length) {
+        onDone?.();
+        return;
+      }
+      const {
+        text,
+        pauseAfter = 1.5
+      } = lines[i++];
+      if (cloud?.available) {
+        // Cloud path: await the audio, then schedule the next line.
+        try {
+          await cloud.speak(text);
+        } catch {
+          /* noop */
+        }
+        if (handle.cancelled) return;
+        handle.timeout = setTimeout(playNext, pauseAfter * 1000);
+        return;
+      }
+
+      // Browser TTS path
+      try {
+        const u = new SpeechSynthesisUtterance(text);
+        if (chosenVoice) u.voice = chosenVoice;
+        u.rate = 0.76;
+        u.pitch = 0.95;
+        u.volume = 0.9;
+        u.lang = chosenVoice?.lang || "en-US";
+        u.onend = () => {
+          if (handle.cancelled) return;
+          handle.timeout = setTimeout(playNext, pauseAfter * 1000);
+        };
+        u.onerror = () => {
+          if (handle.cancelled) return;
+          handle.timeout = setTimeout(playNext, pauseAfter * 1000);
+        };
+        window.speechSynthesis.speak(u);
+      } catch {
+        if (!handle.cancelled) handle.timeout = setTimeout(playNext, 1500);
+      }
+    };
+    playNext();
+    return () => {
+      handle.cancelled = true;
+      if (handle.timeout) clearTimeout(handle.timeout);
+      cloud?.cancel?.();
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        /* noop */
+      }
+    };
+  }, [enabled, chosenVoice, cloud]);
+  const stopSpeaking = useCallback(() => {
+    try {
+      sequenceRef.current.cancelled = true;
+      if (sequenceRef.current.timeout) clearTimeout(sequenceRef.current.timeout);
+      cloud?.cancel?.();
+      window.speechSynthesis?.cancel();
+    } catch {
+      /* noop */
+    }
+  }, [cloud]);
+  useEffect(() => () => stopSpeaking(), [stopSpeaking]);
+
+  // Preview an arbitrary voice (by URI) — used by the voice picker so the
+  // user can audition a candidate without committing to it.
+  const previewVoice = useCallback((voiceURI, sampleText) => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    try {
+      window.speechSynthesis.cancel();
+      const v = voices.find(vv => vv.voiceURI === voiceURI);
+      const u = new SpeechSynthesisUtterance(sampleText || "Breathe in. Hold. Breathe out. Let everything settle.");
+      if (v) u.voice = v;
+      u.rate = 0.78;
+      u.pitch = 0.95;
+      u.volume = 0.95;
+      u.lang = v?.lang || "en-US";
+      window.speechSynthesis.speak(u);
+    } catch {
+      /* noop */
+    }
+  }, [voices]);
+  return {
+    speak,
+    speakCue,
+    speakSequence,
+    stopSpeaking,
+    previewVoice,
+    voices,
+    voiceName: chosenVoice?.name || null,
+    voiceURI: chosenVoice?.voiceURI || null
+  };
+}
+
+// ─── Ambient Sound Engine ──────────────────────────────────────
+function useAmbientSound() {
+  const nodesRef = useRef(null);
+  const isPlayingRef = useRef(false);
+  const start = useCallback(async (toneConfig, ambientBed = "none") => {
+    if (isPlayingRef.current) {
+      // already playing — bring gain back up
+      nodesRef.current?.master?.gain.rampTo(0.18, 1.5);
+      return;
+    }
+    try {
+      await Tone.start();
+      const master = new Tone.Gain(0).toDestination();
+      const reverb = new Tone.Reverb({
+        decay: 9,
+        wet: 0.75
+      }).connect(master);
+      const filter = new Tone.Filter(toneConfig.filterFreq, "lowpass", -24).connect(reverb);
+
+      // Layered drone — root + perfect fifth
+      const rootOsc = new Tone.Oscillator(toneConfig.note, "sine").connect(filter);
+      const fifthOsc = new Tone.Oscillator(toneConfig.fifth, "sine").connect(filter);
+      fifthOsc.volume.value = -8;
+      rootOsc.start();
+      fifthOsc.start();
+
+      // Slow filter sweep
+      const lfo = new Tone.LFO("0.04hz", toneConfig.filterFreq * 0.55, toneConfig.filterFreq * 1.25);
+      lfo.connect(filter.frequency);
+      lfo.start();
+
+      // Optional ambient bed
+      let bed = null;
+      if (ambientBed === "rain") {
+        const noise = new Tone.Noise("pink").start();
+        const noiseFilter = new Tone.Filter(2200, "highpass").connect(reverb);
+        const noiseGain = new Tone.Gain(0.06).connect(noiseFilter);
+        noise.connect(noiseGain);
+        bed = {
+          noise,
+          noiseFilter,
+          noiseGain
+        };
+      } else if (ambientBed === "ocean") {
+        const noise = new Tone.Noise("brown").start();
+        const noiseFilter = new Tone.Filter(420, "lowpass").connect(reverb);
+        const noiseGain = new Tone.Gain(0).connect(noiseFilter);
+        noise.connect(noiseGain);
+        const swell = new Tone.LFO("0.08hz", 0.02, 0.11).connect(noiseGain.gain);
+        swell.start();
+        bed = {
+          noise,
+          noiseFilter,
+          noiseGain,
+          swell
+        };
+      }
+      master.gain.rampTo(0.18, 3);
+      nodesRef.current = {
+        master,
+        reverb,
+        filter,
+        rootOsc,
+        fifthOsc,
+        lfo,
+        bed
+      };
+      isPlayingRef.current = true;
+    } catch (e) {
+      console.warn("Audio failed:", e);
+    }
+  }, []);
+
+  // Pause: ramp fully to silence (was 0.02 which was still audible on
+  // headphones) but keep nodes alive so resume is instant.
+  const pause = useCallback(() => {
+    if (!isPlayingRef.current) return;
+    nodesRef.current?.master?.gain.rampTo(0, 0.4);
+  }, []);
+
+  // Stop: short 300ms fade-out then dispose everything. Was 2 seconds
+  // which felt "stuck". Also schedules the dispose with a hard backup
+  // timeout in case anything in the chain throws.
+  const stop = useCallback(() => {
+    if (!isPlayingRef.current) return;
+    const nodes = nodesRef.current;
+    isPlayingRef.current = false;
+    nodesRef.current = null;
+    try {
+      nodes?.master?.gain.rampTo(0, 0.3);
+    } catch {
+      /* noop */
+    }
+    setTimeout(() => {
+      try {
+        nodes?.rootOsc?.stop();
+        nodes?.fifthOsc?.stop();
+        nodes?.lfo?.stop();
+        nodes?.bed?.swell?.stop();
+        nodes?.bed?.noise?.stop();
+      } catch {
+        /* noop */
+      }
+      try {
+        nodes?.rootOsc?.dispose();
+        nodes?.fifthOsc?.dispose();
+        nodes?.lfo?.dispose();
+        nodes?.filter?.dispose();
+        nodes?.reverb?.dispose();
+        nodes?.master?.dispose();
+        nodes?.bed?.swell?.dispose();
+        nodes?.bed?.noiseGain?.dispose();
+        nodes?.bed?.noiseFilter?.dispose();
+        nodes?.bed?.noise?.dispose();
+      } catch {
+        /* noop */
+      }
+    }, 350);
+  }, []);
+
+  // Hard kill — for emergencies and page-hide. Cuts audio instantly with
+  // no fade, disposes nodes, and suspends the global Tone audio context so
+  // iOS Safari fully releases the audio session.
+  const hardKill = useCallback(() => {
+    const nodes = nodesRef.current;
+    isPlayingRef.current = false;
+    nodesRef.current = null;
+    try {
+      if (nodes?.master?.gain) nodes.master.gain.value = 0;
+      nodes?.rootOsc?.stop();
+      nodes?.fifthOsc?.stop();
+      nodes?.lfo?.stop();
+      nodes?.bed?.swell?.stop();
+      nodes?.bed?.noise?.stop();
+      nodes?.rootOsc?.dispose();
+      nodes?.fifthOsc?.dispose();
+      nodes?.lfo?.dispose();
+      nodes?.filter?.dispose();
+      nodes?.reverb?.dispose();
+      nodes?.master?.dispose();
+      nodes?.bed?.swell?.dispose();
+      nodes?.bed?.noiseGain?.dispose();
+      nodes?.bed?.noiseFilter?.dispose();
+      nodes?.bed?.noise?.dispose();
+    } catch {
+      /* noop */
+    }
+    try {
+      // Suspend the entire Tone audio context so iOS lets go of the audio
+      // session. Tone.start() on the next session will resume it.
+      Tone.getContext().rawContext.suspend?.();
+    } catch {
+      /* noop */
+    }
+  }, []);
+
+  // Suspend audio on page hide / tab switch (iOS keeps WebAudio running
+  // in the background otherwise — that's the "stuck drone" you noticed).
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onHide = () => {
+      try {
+        Tone.getContext().rawContext.suspend?.();
+      } catch {
+        /* noop */
+      }
+    };
+    const onShow = () => {
+      // Don't auto-resume — let the user explicitly restart the session.
+      // (Resuming silently would surprise them with sudden drone.)
+    };
+    const onVis = () => {
+      if (document.visibilityState === "hidden") onHide();else onShow();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("pagehide", onHide);
+    window.addEventListener("beforeunload", onHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("pagehide", onHide);
+      window.removeEventListener("beforeunload", onHide);
+    };
+  }, []);
+
+  // Ring a small bell on top of the running drone (or solo if none)
+  const bell = useCallback(async () => {
+    try {
+      await Tone.start();
+      const bellSynth = new Tone.MetalSynth({
+        frequency: 320,
+        envelope: {
+          attack: 0.001,
+          decay: 1.8,
+          release: 1.2
+        },
+        harmonicity: 4.1,
+        modulationIndex: 22,
+        resonance: 3200,
+        octaves: 1.5
+      }).toDestination();
+      bellSynth.volume.value = -18;
+      bellSynth.triggerAttackRelease("C5", "8n");
+      setTimeout(() => bellSynth.dispose(), 4000);
+    } catch {
+      /* noop */
+    }
+  }, []);
+  useEffect(() => () => {
+    try {
+      const n = nodesRef.current;
+      n?.rootOsc?.stop();
+      n?.fifthOsc?.stop();
+      n?.lfo?.stop();
+      n?.bed?.noise?.stop();
+      n?.bed?.swell?.stop();
+      n?.rootOsc?.dispose();
+      n?.fifthOsc?.dispose();
+      n?.lfo?.dispose();
+      n?.filter?.dispose();
+      n?.reverb?.dispose();
+      n?.master?.dispose();
+    } catch {
+      /* noop */
+    }
+  }, []);
+  return {
+    start,
+    pause,
+    stop,
+    bell,
+    hardKill
+  };
+}
+
+// ─── Easings ───────────────────────────────────────────────────
+function easeInOutSine(t) {
+  return -(Math.cos(Math.PI * t) - 1) / 2;
+}
+
+// ─── Breathing Circle ──────────────────────────────────────────
+function BreathingCircle({
+  pattern,
+  color,
+  isActive,
+  reducedMotion,
+  onPhaseStart
+}) {
+  const [phase, setPhase] = useState("inhale");
+  const [progress, setProgress] = useState(0);
+  const [cycleCount, setCycleCount] = useState(0);
+  const frameRef = useRef(null);
+  const startTimeRef = useRef(null);
+  const onPhaseStartRef = useRef(onPhaseStart);
+  useEffect(() => {
+    onPhaseStartRef.current = onPhaseStart;
+  }, [onPhaseStart]);
+  const phases = useMemo(() => [{
+    name: "inhale",
+    label: "Breathe In",
+    duration: pattern.inhale
+  }, {
+    name: "hold",
+    label: "Hold",
+    duration: pattern.hold
+  }, {
+    name: "exhale",
+    label: "Breathe Out",
+    duration: pattern.exhale
+  }, {
+    name: "holdOut",
+    label: "Hold",
+    duration: pattern.holdOut
+  }].filter(p => p.duration > 0), [pattern]);
+  useEffect(() => {
+    if (!isActive) {
+      cancelAnimationFrame(frameRef.current);
+      setPhase(phases[0]?.name || "inhale");
+      setProgress(0);
+      return;
+    }
+    let phaseIndex = 0;
+    setPhase(phases[0].name);
+    onPhaseStartRef.current?.(phases[0].name, 0);
+    startTimeRef.current = performance.now();
+    const tick = now => {
+      const elapsed = (now - startTimeRef.current) / 1000;
+      const dur = phases[phaseIndex].duration;
+      const p = Math.min(elapsed / dur, 1);
+      setProgress(p);
+      if (p >= 1) {
+        phaseIndex = (phaseIndex + 1) % phases.length;
+        if (phaseIndex === 0) setCycleCount(c => c + 1);
+        setPhase(phases[phaseIndex].name);
+        startTimeRef.current = now;
+        onPhaseStartRef.current?.(phases[phaseIndex].name, phaseIndex);
+      }
+      frameRef.current = requestAnimationFrame(tick);
+    };
+    frameRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frameRef.current);
+  }, [isActive, phases]);
+  const minScale = reducedMotion ? 0.85 : 0.6;
+  const maxScale = 1.0;
+  const range = maxScale - minScale;
+  const scale = phase === "inhale" ? minScale + range * easeInOutSine(progress) : phase === "exhale" ? maxScale - range * easeInOutSine(progress) : phase === "hold" ? maxScale : minScale;
+  const opacity = phase === "hold" || phase === "holdOut" ? 0.6 + 0.4 * Math.sin(progress * Math.PI) : 0.75;
+  const currentLabel = phases.find(p => p.name === phase)?.label || "";
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      gap: 20
+    },
+    children: [/*#__PURE__*/_jsxs("div", {
+      style: {
+        position: "relative",
+        width: 240,
+        height: 240,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center"
+      },
+      children: [[0, 1, 2].map(i => /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "absolute",
+          width: 190 - i * 22,
+          height: 190 - i * 22,
+          borderRadius: "50%",
+          background: `radial-gradient(circle, ${color}${i === 0 ? "33" : i === 1 ? "22" : "11"}, transparent 70%)`,
+          transform: `scale(${scale * (1 + i * 0.08)})`,
+          transition: reducedMotion ? "transform 0.4s ease" : "transform 0.1s linear",
+          opacity: opacity * (1 - i * 0.2),
+          willChange: "transform"
+        }
+      }, i)), /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "absolute",
+          width: 130,
+          height: 130,
+          borderRadius: "50%",
+          border: `1.5px solid ${color}55`,
+          transform: `scale(${scale})`,
+          transition: reducedMotion ? "transform 0.4s ease" : "transform 0.1s linear",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          backdropFilter: "blur(6px)",
+          WebkitBackdropFilter: "blur(6px)",
+          background: `${color}12`,
+          willChange: "transform"
+        },
+        children: /*#__PURE__*/_jsx("span", {
+          style: {
+            color: color,
+            fontSize: 13,
+            letterSpacing: 3,
+            textTransform: "uppercase",
+            opacity: 0.95,
+            fontWeight: 300
+          },
+          children: currentLabel
+        })
+      })]
+    }), isActive && /*#__PURE__*/_jsxs("div", {
+      style: {
+        color: "#ffffff45",
+        fontSize: 11,
+        letterSpacing: 4,
+        fontWeight: 500
+      },
+      children: ["CYCLE \xB7 ", cycleCount + 1]
+    })]
+  });
+}
+
+// ─── Progress Ring (around timer) ──────────────────────────────
+function ProgressRing({
+  progress,
+  color,
+  size = 280,
+  stroke = 1.5
+}) {
+  const r = (size - stroke) / 2;
+  const c = 2 * Math.PI * r;
+  const offset = c * (1 - progress);
+  return /*#__PURE__*/_jsxs("svg", {
+    width: size,
+    height: size,
+    style: {
+      position: "absolute",
+      top: "50%",
+      left: "50%",
+      transform: "translate(-50%, -50%)",
+      pointerEvents: "none"
+    },
+    children: [/*#__PURE__*/_jsx("circle", {
+      cx: size / 2,
+      cy: size / 2,
+      r: r,
+      fill: "none",
+      stroke: "#ffffff10",
+      strokeWidth: stroke
+    }), /*#__PURE__*/_jsx("circle", {
+      cx: size / 2,
+      cy: size / 2,
+      r: r,
+      fill: "none",
+      stroke: color,
+      strokeOpacity: 0.5,
+      strokeWidth: stroke,
+      strokeDasharray: c,
+      strokeDashoffset: offset,
+      strokeLinecap: "round",
+      transform: `rotate(-90 ${size / 2} ${size / 2})`,
+      style: {
+        transition: "stroke-dashoffset 1s linear"
+      }
+    })]
+  });
+}
+
+// ─── Timer Display ─────────────────────────────────────────────
+function TimerDisplay({
+  remaining,
+  color
+}) {
+  const m = Math.floor(remaining / 60);
+  const s = remaining % 60;
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      fontSize: 44,
+      fontWeight: 200,
+      color: color,
+      letterSpacing: 4,
+      opacity: 0.9,
+      textAlign: "center",
+      fontVariantNumeric: "tabular-nums"
+    },
+    children: [m, ":", s.toString().padStart(2, "0")]
+  });
+}
+
+// ─── Voice picker row ──────────────────────────────────────────
+function VoiceRow({
+  name,
+  lang,
+  selected,
+  onSelect,
+  onPreview,
+  color
+}) {
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      padding: "10px 12px",
+      borderRadius: 10,
+      background: selected ? `${color}18` : "transparent",
+      border: `1px solid ${selected ? color + "40" : "transparent"}`,
+      marginBottom: 4
+    },
+    children: [/*#__PURE__*/_jsxs("div", {
+      onClick: onSelect,
+      style: {
+        flex: 1,
+        cursor: "pointer",
+        minWidth: 0
+      },
+      children: [/*#__PURE__*/_jsx("div", {
+        style: {
+          color: selected ? color : "#ffffffd0",
+          fontSize: 13,
+          fontWeight: 400,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap"
+        },
+        children: name
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          color: "#ffffff40",
+          fontSize: 10,
+          letterSpacing: 1,
+          marginTop: 2
+        },
+        children: lang
+      })]
+    }), onPreview && /*#__PURE__*/_jsx("button", {
+      onClick: e => {
+        e.stopPropagation();
+        onPreview();
+      },
+      style: {
+        background: "#ffffff08",
+        border: "1px solid #ffffff15",
+        color: "#ffffffa0",
+        padding: "6px 12px",
+        borderRadius: 14,
+        fontSize: 11,
+        letterSpacing: 1,
+        textTransform: "uppercase",
+        cursor: "pointer",
+        flexShrink: 0
+      },
+      children: "Preview"
+    })]
+  });
+}
+
+// ─── Settings Sheet ────────────────────────────────────────────
+function SettingsSheet({
+  open,
+  prefs,
+  setPrefs,
+  onClose,
+  color = "#85CDCA",
+  voiceName,
+  voiceURI,
+  availableVoices = [],
+  previewVoice,
+  cloudTTS,
+  voicePack
+}) {
+  const [showKey, setShowKey] = useState(false);
+  const [previewingCloud, setPreviewingCloud] = useState(null);
+
+  // One-time cleanup: clear any stale manualVoiceURI from when the
+  // advanced voice list existed. Without this users who picked "Albert"
+  // or similar from an older build would stay stuck on it.
+  useEffect(() => {
+    if (prefs.manualVoiceURI) {
+      setPrefs(p => ({
+        ...p,
+        manualVoiceURI: null
+      }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  if (!open) return null;
+  const update = patch => setPrefs(p => ({
+    ...p,
+    ...patch
+  }));
+
+  // Preview an OpenAI voice by making a one-off TTS request and playing it.
+  const previewCloudVoice = async voiceId => {
+    if (!prefs.openAIKey?.trim()) return;
+    setPreviewingCloud(voiceId);
+    try {
+      const res = await fetch(CLOUD_TTS_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${prefs.openAIKey.trim()}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: CLOUD_TTS_MODEL,
+          voice: voiceId,
+          input: "Breathe in. Hold. Breathe out. Let everything settle.",
+          response_format: "mp3",
+          speed: 0.92
+        })
+      });
+      if (!res.ok) {
+        alert("OpenAI TTS error: " + res.status + ". Check your API key.");
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = new Audio(url);
+      a.volume = 0.95;
+      a.play();
+      a.onended = () => URL.revokeObjectURL(url);
+    } catch (e) {
+      alert("Preview failed: " + e.message);
+    } finally {
+      setPreviewingCloud(null);
+    }
+  };
+  return /*#__PURE__*/_jsx("div", {
+    onClick: onClose,
+    style: {
+      position: "fixed",
+      inset: 0,
+      background: "rgba(0,0,0,0.55)",
+      backdropFilter: "blur(8px)",
+      WebkitBackdropFilter: "blur(8px)",
+      display: "flex",
+      alignItems: "flex-end",
+      justifyContent: "center",
+      zIndex: 50,
+      animation: "fadeIn 0.25s ease"
+    },
+    children: /*#__PURE__*/_jsxs("div", {
+      onClick: e => e.stopPropagation(),
+      style: {
+        width: "100%",
+        maxWidth: 480,
+        background: "#16161e",
+        borderTopLeftRadius: 28,
+        borderTopRightRadius: 28,
+        padding: "28px 24px calc(28px + env(safe-area-inset-bottom)) 24px",
+        color: "#ffffffd0",
+        animation: "slideUp 0.35s cubic-bezier(.2,.8,.2,1)",
+        maxHeight: "85vh",
+        overflowY: "auto"
+      },
+      children: [/*#__PURE__*/_jsx("div", {
+        style: {
+          width: 40,
+          height: 4,
+          background: "#ffffff20",
+          borderRadius: 2,
+          margin: "0 auto 20px"
+        }
+      }), /*#__PURE__*/_jsx("h3", {
+        style: {
+          color: color,
+          fontSize: 14,
+          letterSpacing: 4,
+          textTransform: "uppercase",
+          fontWeight: 400,
+          margin: "0 0 24px",
+          textAlign: "center"
+        },
+        children: "Settings"
+      }), /*#__PURE__*/_jsx(ToggleRow, {
+        label: "Haptic feedback",
+        hint: "Gentle pulse on each breath transition",
+        value: prefs.haptics,
+        onChange: v => update({
+          haptics: v
+        }),
+        color: color
+      }), /*#__PURE__*/_jsx(ToggleRow, {
+        label: "Voice guidance",
+        hint: "Speak each guidance line aloud",
+        value: prefs.voice,
+        onChange: v => update({
+          voice: v
+        }),
+        color: color
+      }), /*#__PURE__*/_jsx(ToggleRow, {
+        label: "Breath cues",
+        hint: "Soft spoken cues on every inhale / hold / exhale",
+        value: prefs.breathCues,
+        onChange: v => update({
+          breathCues: v
+        }),
+        color: color
+      }), /*#__PURE__*/_jsxs(SettingGroup, {
+        label: "Voice",
+        color: color,
+        children: [voicePack && /*#__PURE__*/_jsxs("div", {
+          style: {
+            marginBottom: 14,
+            padding: "10px 12px",
+            borderRadius: 10,
+            background: voicePack.available ? `${color}15` : voicePack.detected === false ? "#ffffff05" : "#ffffff05",
+            border: `1px solid ${voicePack.available ? color + "40" : "#ffffff10"}`,
+            color: voicePack.available ? color : "#ffffff70",
+            fontSize: 11,
+            lineHeight: 1.5,
+            letterSpacing: 0.3
+          },
+          children: [voicePack.detected === null && "Checking for voice pack…", voicePack.available && /*#__PURE__*/_jsx(_Fragment, {
+            children: "\u2713 Voice pack loaded \u2014 using pre-generated MP3s (free, instant)."
+          }), voicePack.detected === false && /*#__PURE__*/_jsx(_Fragment, {
+            children: "No voice pack found at /voices/. Falling back to browser voices below. Run generate-voices.mjs to build one."
+          })]
+        }), /*#__PURE__*/_jsx("div", {
+          style: {
+            display: "flex",
+            gap: 10
+          },
+          children: ["female", "male"].map(g => {
+            const active = prefs.voiceGender === g && !prefs.manualVoiceURI;
+            // Find the best voice the auto-picker would pick for this gender,
+            // so we can label the chip with its actual name.
+            const sample = pickVoice(availableVoices, g, null);
+            return /*#__PURE__*/_jsxs("button", {
+              onClick: async () => {
+                update({
+                  voiceGender: g,
+                  manualVoiceURI: null
+                });
+                // Audition the choice immediately. Prefer the voice
+                // pack since that's what'll actually play during sessions.
+                if (voicePack?.available) {
+                  try {
+                    await voicePack.speak?.("Breathe in");
+                  } catch {/* noop */}
+                } else if (sample) {
+                  previewVoice?.(sample.voiceURI);
+                }
+              },
+              style: {
+                flex: 1,
+                background: active ? `${color}22` : "#ffffff06",
+                border: `1px solid ${active ? color + "55" : "#ffffff12"}`,
+                color: active ? color : "#ffffffb0",
+                padding: "14px 12px",
+                borderRadius: 14,
+                fontSize: 13,
+                letterSpacing: 2,
+                textTransform: "uppercase",
+                cursor: "pointer",
+                textAlign: "center"
+              },
+              children: [/*#__PURE__*/_jsx("div", {
+                style: {
+                  fontWeight: 500
+                },
+                children: g === "female" ? "Female" : "Male"
+              }), /*#__PURE__*/_jsx("div", {
+                style: {
+                  color: "#ffffff55",
+                  fontSize: 10,
+                  letterSpacing: 1,
+                  marginTop: 4,
+                  textTransform: "none",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap"
+                },
+                children: voicePack?.available ? g === "female" ? "Bella · pack" : "Adam · pack" : sample?.name?.replace(/\s*\((Enhanced|Premium|Neural)\)/i, "") || "auto"
+              })]
+            }, g);
+          })
+        }), /*#__PURE__*/_jsxs("div", {
+          style: {
+            color: "#ffffff35",
+            fontSize: 11,
+            letterSpacing: 1,
+            marginTop: 10,
+            textAlign: "center"
+          },
+          children: ["Using:", " ", voicePack?.available ? `voice pack · ${prefs.voiceGender === "male" ? "Adam" : "Bella"}` : voiceName ? `browser · ${voiceName}` : "—"]
+        }), /*#__PURE__*/_jsx("div", {
+          style: {
+            marginTop: 12,
+            padding: 12,
+            background: "#ffffff05",
+            border: "1px solid #ffffff0a",
+            borderRadius: 10,
+            color: "#ffffff60",
+            fontSize: 11,
+            lineHeight: 1.5,
+            letterSpacing: 0.3
+          },
+          children: "iOS doesn't expose Siri's voices to web apps \u2014 that's an Apple restriction. For truly great voices, enable Premium Voices below."
+        })]
+      }), /*#__PURE__*/_jsxs(SettingGroup, {
+        label: "Premium voices \xB7 OpenAI",
+        color: color,
+        children: [/*#__PURE__*/_jsx(ToggleRow, {
+          label: "Use premium voices",
+          hint: "Routes spoken guidance through OpenAI TTS. Sounds dramatically better than browser voices. ~$0.01\u20130.03 per session, repeat sessions are cached and free.",
+          value: !!prefs.cloudTTS,
+          onChange: v => update({
+            cloudTTS: v
+          }),
+          color: color
+        }), /*#__PURE__*/_jsxs("div", {
+          style: {
+            marginTop: 14
+          },
+          children: [/*#__PURE__*/_jsx("div", {
+            style: {
+              color: "#ffffff80",
+              fontSize: 12,
+              letterSpacing: 1,
+              marginBottom: 8
+            },
+            children: "OpenAI API key"
+          }), /*#__PURE__*/_jsxs("div", {
+            style: {
+              display: "flex",
+              gap: 8
+            },
+            children: [/*#__PURE__*/_jsx("input", {
+              type: showKey ? "text" : "password",
+              value: prefs.openAIKey || "",
+              onChange: e => update({
+                openAIKey: e.target.value
+              }),
+              placeholder: "sk-...",
+              autoComplete: "off",
+              autoCorrect: "off",
+              autoCapitalize: "off",
+              spellCheck: false,
+              style: {
+                flex: 1,
+                background: "#0a0a12",
+                border: "1px solid #ffffff15",
+                borderRadius: 10,
+                padding: "10px 12px",
+                color: "#ffffffd0",
+                fontSize: 13,
+                fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                outline: "none",
+                minWidth: 0
+              }
+            }), /*#__PURE__*/_jsx("button", {
+              onClick: () => setShowKey(s => !s),
+              style: {
+                background: "#ffffff08",
+                border: "1px solid #ffffff15",
+                color: "#ffffff80",
+                padding: "0 12px",
+                borderRadius: 10,
+                fontSize: 11,
+                letterSpacing: 1,
+                textTransform: "uppercase",
+                cursor: "pointer",
+                flexShrink: 0
+              },
+              children: showKey ? "Hide" : "Show"
+            })]
+          }), /*#__PURE__*/_jsxs("div", {
+            style: {
+              color: "#ffffff35",
+              fontSize: 11,
+              marginTop: 6,
+              lineHeight: 1.5
+            },
+            children: ["Get one at", " ", /*#__PURE__*/_jsx("a", {
+              href: "https://platform.openai.com/api-keys",
+              target: "_blank",
+              rel: "noreferrer",
+              style: {
+                color: color,
+                textDecoration: "none"
+              },
+              children: "platform.openai.com/api-keys"
+            }), ". Stored only on this device."]
+          })]
+        }), prefs.openAIKey?.trim() && /*#__PURE__*/_jsxs("div", {
+          style: {
+            marginTop: 16
+          },
+          children: [/*#__PURE__*/_jsx("div", {
+            style: {
+              color: "#ffffff80",
+              fontSize: 12,
+              letterSpacing: 1,
+              marginBottom: 10
+            },
+            children: "Voice"
+          }), /*#__PURE__*/_jsx("div", {
+            style: {
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: 8
+            },
+            children: CLOUD_VOICES.map(v => {
+              const active = prefs.cloudVoice === v.id;
+              return /*#__PURE__*/_jsxs("div", {
+                style: {
+                  background: active ? `${color}22` : "#ffffff06",
+                  border: `1px solid ${active ? color + "55" : "#ffffff12"}`,
+                  borderRadius: 12,
+                  padding: 10,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 6
+                },
+                children: [/*#__PURE__*/_jsxs("div", {
+                  onClick: () => update({
+                    cloudVoice: v.id
+                  }),
+                  style: {
+                    cursor: "pointer"
+                  },
+                  children: [/*#__PURE__*/_jsxs("div", {
+                    style: {
+                      color: active ? color : "#ffffffd0",
+                      fontSize: 14,
+                      fontWeight: 500,
+                      letterSpacing: 1
+                    },
+                    children: [v.label, /*#__PURE__*/_jsxs("span", {
+                      style: {
+                        fontSize: 10,
+                        color: "#ffffff50",
+                        marginLeft: 6,
+                        fontWeight: 400,
+                        letterSpacing: 0
+                      },
+                      children: ["(", v.gender, ")"]
+                    })]
+                  }), /*#__PURE__*/_jsx("div", {
+                    style: {
+                      color: "#ffffff50",
+                      fontSize: 10,
+                      marginTop: 3,
+                      lineHeight: 1.4
+                    },
+                    children: v.note
+                  })]
+                }), /*#__PURE__*/_jsx("button", {
+                  onClick: () => previewCloudVoice(v.id),
+                  disabled: previewingCloud === v.id,
+                  style: {
+                    background: "#ffffff08",
+                    border: "1px solid #ffffff15",
+                    color: "#ffffffa0",
+                    padding: "5px 10px",
+                    borderRadius: 12,
+                    fontSize: 10,
+                    letterSpacing: 1,
+                    textTransform: "uppercase",
+                    cursor: previewingCloud === v.id ? "wait" : "pointer",
+                    alignSelf: "flex-start"
+                  },
+                  children: previewingCloud === v.id ? "Loading…" : "Preview"
+                })]
+              }, v.id);
+            })
+          })]
+        }), /*#__PURE__*/_jsx("div", {
+          style: {
+            marginTop: 14,
+            padding: 12,
+            background: `${color}08`,
+            border: `1px solid ${color}20`,
+            borderRadius: 10,
+            color: "#ffffff70",
+            fontSize: 11,
+            lineHeight: 1.5,
+            letterSpacing: 0.3
+          },
+          children: cloudTTS?.available ? "✓ Premium voices active — guidance will use OpenAI." : "Add your key and toggle Use premium voices on to activate."
+        })]
+      }), /*#__PURE__*/_jsx(ToggleRow, {
+        label: "Opening bell",
+        hint: "Chime at the start of every session",
+        value: prefs.startBell,
+        onChange: v => update({
+          startBell: v
+        }),
+        color: color
+      }), /*#__PURE__*/_jsx(ToggleRow, {
+        label: "Closing bell",
+        hint: "Chime when the session ends",
+        value: prefs.endBell,
+        onChange: v => update({
+          endBell: v
+        }),
+        color: color
+      }), /*#__PURE__*/_jsx(SettingGroup, {
+        label: "Interval bell",
+        color: color,
+        children: /*#__PURE__*/_jsx(Pills, {
+          options: [{
+            value: 0,
+            label: "Off"
+          }, {
+            value: 2,
+            label: "2 min"
+          }, {
+            value: 5,
+            label: "5 min"
+          }, {
+            value: 10,
+            label: "10 min"
+          }],
+          value: prefs.intervalBell,
+          onChange: v => update({
+            intervalBell: v
+          }),
+          color: color
+        })
+      }), /*#__PURE__*/_jsx(SettingGroup, {
+        label: "Ambient layer",
+        color: color,
+        children: /*#__PURE__*/_jsx(Pills, {
+          options: AMBIENT_BEDS.map(b => ({
+            value: b.id,
+            label: b.label
+          })),
+          value: prefs.ambient,
+          onChange: v => update({
+            ambient: v
+          }),
+          color: color
+        })
+      }), /*#__PURE__*/_jsx(ToggleRow, {
+        label: "Reduced motion",
+        hint: "Calmer animations (also respects iOS setting)",
+        value: prefs.reducedMotion,
+        onChange: v => update({
+          reducedMotion: v
+        }),
+        color: color
+      }), /*#__PURE__*/_jsx("button", {
+        onClick: onClose,
+        style: {
+          marginTop: 20,
+          width: "100%",
+          background: `${color}18`,
+          border: `1px solid ${color}40`,
+          color: color,
+          padding: "14px",
+          borderRadius: 16,
+          fontSize: 13,
+          letterSpacing: 3,
+          textTransform: "uppercase",
+          cursor: "pointer",
+          fontWeight: 500
+        },
+        children: "Done"
+      })]
+    })
+  });
+}
+function ToggleRow({
+  label,
+  hint,
+  value,
+  onChange,
+  color
+}) {
+  return /*#__PURE__*/_jsxs("div", {
+    onClick: () => onChange(!value),
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      padding: "14px 4px",
+      borderBottom: "1px solid #ffffff08",
+      cursor: "pointer",
+      gap: 12
+    },
+    children: [/*#__PURE__*/_jsxs("div", {
+      style: {
+        flex: 1,
+        minWidth: 0
+      },
+      children: [/*#__PURE__*/_jsx("div", {
+        style: {
+          color: "#ffffffd0",
+          fontSize: 15,
+          fontWeight: 400
+        },
+        children: label
+      }), hint && /*#__PURE__*/_jsx("div", {
+        style: {
+          color: "#ffffff45",
+          fontSize: 12,
+          marginTop: 3,
+          lineHeight: 1.4
+        },
+        children: hint
+      })]
+    }), /*#__PURE__*/_jsx("div", {
+      style: {
+        width: 44,
+        height: 26,
+        borderRadius: 13,
+        background: value ? `${color}` : "#ffffff15",
+        position: "relative",
+        transition: "background 0.25s",
+        flexShrink: 0
+      },
+      children: /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "absolute",
+          top: 2,
+          left: value ? 20 : 2,
+          width: 22,
+          height: 22,
+          borderRadius: "50%",
+          background: "#fff",
+          transition: "left 0.25s cubic-bezier(.2,.8,.2,1)",
+          boxShadow: "0 2px 4px rgba(0,0,0,0.3)"
+        }
+      })
+    })]
+  });
+}
+function SettingGroup({
+  label,
+  children,
+  color
+}) {
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      padding: "16px 0 4px",
+      borderBottom: "1px solid #ffffff08"
+    },
+    children: [/*#__PURE__*/_jsx("div", {
+      style: {
+        color: "#ffffff50",
+        fontSize: 11,
+        letterSpacing: 3,
+        textTransform: "uppercase",
+        marginBottom: 12
+      },
+      children: label
+    }), children]
+  });
+}
+function Pills({
+  options,
+  value,
+  onChange,
+  color
+}) {
+  return /*#__PURE__*/_jsx("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8
+    },
+    children: options.map(o => {
+      const active = o.value === value;
+      return /*#__PURE__*/_jsx("button", {
+        onClick: () => onChange(o.value),
+        style: {
+          background: active ? `${color}25` : "#ffffff08",
+          border: `1px solid ${active ? color + "60" : "#ffffff10"}`,
+          color: active ? color : "#ffffff90",
+          padding: "9px 16px",
+          borderRadius: 20,
+          fontSize: 13,
+          letterSpacing: 1,
+          cursor: "pointer",
+          transition: "all 0.2s ease"
+        },
+        children: o.label
+      }, String(o.value));
+    })
+  });
+}
+
+// ─── Stats helpers ─────────────────────────────────────────────
+function isoDate(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function daysBetween(a, b) {
+  const da = new Date(a + "T00:00:00");
+  const db = new Date(b + "T00:00:00");
+  return Math.round((db - da) / 86400000);
+}
+function recordSession(durationSec, categoryId, moodLabel) {
+  const stats = safeStorage.get(STATS_KEY, {
+    streak: 0,
+    longest: 0,
+    totalMinutes: 0,
+    totalSessions: 0,
+    lastDate: null
+  });
+  const today = isoDate();
+  if (stats.lastDate === today) {
+    // already counted today; just add minutes
+  } else if (stats.lastDate && daysBetween(stats.lastDate, today) === 1) {
+    stats.streak += 1;
+  } else {
+    stats.streak = 1;
+  }
+  stats.lastDate = today;
+  stats.longest = Math.max(stats.longest, stats.streak);
+  stats.totalMinutes += Math.round(durationSec / 60);
+  stats.totalSessions += 1;
+  safeStorage.set(STATS_KEY, stats);
+  const history = safeStorage.get(HISTORY_KEY, []);
+  history.unshift({
+    date: new Date().toISOString(),
+    categoryId,
+    seconds: durationSec,
+    mood: moodLabel || null
+  });
+  safeStorage.set(HISTORY_KEY, history.slice(0, 60));
+  return stats;
+}
+
+// ─── Main App ──────────────────────────────────────────────────
+// ─── Debug overlay ─────────────────────────────────────────────
+// On-screen log viewer for diagnosing audio issues without DevTools.
+function DebugOverlay({
+  open,
+  onClose
+}) {
+  const entries = useDebugLog();
+  const scrollRef = useRef(null);
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [entries]);
+  if (!open) return null;
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      position: "fixed",
+      top: "env(safe-area-inset-top)",
+      left: 0,
+      right: 0,
+      maxHeight: "55vh",
+      background: "rgba(0,0,0,0.92)",
+      color: "#9affb1",
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      fontSize: 9.5,
+      lineHeight: 1.45,
+      zIndex: 999,
+      borderBottom: "1px solid #2a2a2a",
+      padding: "10px 12px",
+      overflowY: "auto",
+      WebkitOverflowScrolling: "touch"
+    },
+    ref: scrollRef,
+    children: [/*#__PURE__*/_jsxs("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        marginBottom: 8
+      },
+      children: [/*#__PURE__*/_jsxs("span", {
+        style: {
+          color: "#fff",
+          fontWeight: 600,
+          letterSpacing: 1
+        },
+        children: ["DEBUG \xB7 ", entries.length, " entries"]
+      }), /*#__PURE__*/_jsx("button", {
+        onClick: onClose,
+        style: {
+          background: "#ffffff20",
+          border: "none",
+          color: "#fff",
+          fontSize: 11,
+          padding: "2px 10px",
+          borderRadius: 6,
+          cursor: "pointer"
+        },
+        children: "close"
+      })]
+    }), entries.length === 0 && /*#__PURE__*/_jsx("div", {
+      style: {
+        color: "#888"
+      },
+      children: "No entries yet. Start a session."
+    }), entries.map((e, i) => {
+      const ts = new Date(e.t).toISOString().slice(14, 22);
+      const color = e.level === "error" ? "#ff8080" : e.level === "warn" ? "#ffd080" : "#9affb1";
+      return /*#__PURE__*/_jsxs("div", {
+        style: {
+          color,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word"
+        },
+        children: [/*#__PURE__*/_jsx("span", {
+          style: {
+            color: "#666"
+          },
+          children: ts
+        }), " ", e.msg]
+      }, i);
+    })]
+  });
+}
+function MeditationApp() {
+  const [screen, setScreen] = useState("home");
+  const [selectedCategory, setSelectedCategory] = useState(null);
+  const [selectedDuration, setSelectedDuration] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [remaining, setRemaining] = useState(0);
+  const [guidanceIndex, setGuidanceIndex] = useState(0);
+  const [guidanceFade, setGuidanceFade] = useState(1);
+  const [sessionComplete, setSessionComplete] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showDebug, setShowDebug] = useState(false);
+  const [moodChoice, setMoodChoice] = useState(null);
+  // Headspace-style phases: "intro" → "practice" → "closing"
+  const [sessionPhase, setSessionPhase] = useState("practice");
+  const cancelSequenceRef = useRef(null);
+
+  // Home mode: which set of cards we show on the home grid
+  const [homeMode, setHomeMode] = useState("meditate"); // "meditate" | "breathe" | "focus" | "wakeup"
+
+  // Breathwork state
+  const [selectedBreathwork, setSelectedBreathwork] = useState(null);
+  const [breathworkMinutes, setBreathworkMinutes] = useState(3);
+
+  // Focus state
+  const [selectedFocus, setSelectedFocus] = useState(null);
+  const [focusElapsed, setFocusElapsed] = useState(0); // seconds inside current focus block
+  const [focusBlockKind, setFocusBlockKind] = useState("focus"); // "focus" | "break"
+  const [focusBlockIndex, setFocusBlockIndex] = useState(0);
+  const focusTimerRef = useRef(null);
+
+  // Wake-up state
+  const [wakeUpStage, setWakeUpStage] = useState("opening"); // opening | breath | intention | closing | done
+  const wakeUpStartRef = useRef(null);
+  const [prefs, setPrefs] = usePersistedState(PREFS_KEY, DEFAULT_PREFS);
+  const [stats, setStats] = useState(() => safeStorage.get(STATS_KEY, null));
+  const systemReducedMotion = usePrefersReducedMotion();
+  const reducedMotion = prefs.reducedMotion || systemReducedMotion;
+  const timerRef = useRef(null);
+  const guidanceTimerRef = useRef(null);
+  const intervalBellRef = useRef(null);
+  const ambient = useAmbientSound();
+  const haptic = useHaptics(prefs.haptics);
+  // Local voice pack — pre-generated MP3s hosted alongside the app at
+  // /voices/{gender}/. If present, this is used in preference to anything
+  // else: zero API calls, zero cost, sounds great.
+  const voicePack = useVoicePack(prefs.voice, prefs.voiceGender);
+  // OpenAI TTS — used when voice pack isn't available and user has a key.
+  const cloudTTS = useCloudTTS(!!prefs.cloudTTS && !!prefs.openAIKey?.trim(), prefs.openAIKey?.trim(), prefs.cloudVoice || "nova");
+  // The voice provider passed into useVoiceGuidance. Voice pack wins if
+  // available; otherwise we hand the cloud the wheel.
+  const voiceProvider = voicePack.available ? voicePack : cloudTTS;
+  const {
+    speak,
+    speakCue,
+    speakSequence,
+    stopSpeaking,
+    previewVoice,
+    voices: availableVoices,
+    voiceName,
+    voiceURI
+  } = useVoiceGuidance(prefs.voice, prefs.voiceGender,
+  // When voice pack is active, breath cues add a lot of audio churn
+  // for marginal benefit. Default OFF for pack users; they can opt
+  // back in via the Breath cues toggle in Settings.
+  prefs.voice && prefs.breathCues && !voicePack.available, prefs.manualVoiceURI, voiceProvider);
+  useWakeLock(isPlaying);
+
+  // Timer logic — countdown used by meditation, breathwork, and wake-up.
+  // Focus mode uses its own up-counter and exits early below.
+  useEffect(() => {
+    if (!isPlaying || screen === "focus-session" || screen === "wakeup-session") {
+      clearInterval(timerRef.current);
+      return;
+    }
+    timerRef.current = setInterval(() => {
+      setRemaining(r => {
+        if (r <= 1) {
+          setIsPlaying(false);
+          setSessionComplete(true);
+          ambient.stop();
+          if (prefs.endBell) ambient.bell();
+          haptic([20, 80, 20, 80, 30]);
+          const totalSeconds = selectedDuration?.seconds || (breathworkMinutes ? breathworkMinutes * 60 : 0);
+          const id = selectedCategory?.id || selectedBreathwork?.id || "session";
+          const newStats = recordSession(totalSeconds, id, null);
+          setStats(newStats);
+          return 0;
+        }
+        return r - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timerRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying]);
+
+  // Guidance rotation — only during main practice
+  useEffect(() => {
+    if (!isPlaying || !selectedCategory || sessionPhase !== "practice") return;
+    const pat = selectedCategory.breathPattern;
+    const totalCycle = pat.inhale + pat.hold + pat.exhale + (pat.holdOut || 0);
+    const interval = totalCycle * 2 * 1000;
+    const rotate = () => {
+      setGuidanceFade(0);
+      setTimeout(() => {
+        setGuidanceIndex(i => {
+          const next = (i + 1) % selectedCategory.guidance.length;
+          if (prefs.voice) speak(selectedCategory.guidance[next]);
+          return next;
+        });
+        setGuidanceFade(1);
+      }, 800);
+    };
+    guidanceTimerRef.current = setInterval(rotate, interval);
+    return () => clearInterval(guidanceTimerRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, selectedCategory, sessionPhase]);
+
+  // Interval bell — only during the main practice (not during intro/closing)
+  useEffect(() => {
+    clearInterval(intervalBellRef.current);
+    if (!isPlaying || !prefs.intervalBell || sessionPhase !== "practice") return;
+    intervalBellRef.current = setInterval(() => {
+      ambient.bell();
+      haptic(15);
+    }, prefs.intervalBell * 60 * 1000);
+    return () => clearInterval(intervalBellRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, prefs.intervalBell, sessionPhase]);
+
+  // Focus-mode cycle timer (separate from the meditation/breathwork timer).
+  // Counts up through focus/break blocks and bells on each transition.
+  useEffect(() => {
+    clearInterval(focusTimerRef.current);
+    if (!isPlaying || screen !== "focus-session" || !selectedFocus) return;
+    focusTimerRef.current = setInterval(() => {
+      setFocusElapsed(t => {
+        const blockSeconds = (focusBlockKind === "focus" ? selectedFocus.focusMin : selectedFocus.breakMin) * 60;
+        if (t + 1 >= blockSeconds) {
+          ambient.bell();
+          haptic(15);
+          if (focusBlockKind === "focus" && selectedFocus.breakMin > 0) {
+            setFocusBlockKind("break");
+            return 0;
+          }
+          if (selectedFocus.repeat) {
+            setFocusBlockKind("focus");
+            setFocusBlockIndex(i => i + 1);
+            return 0;
+          }
+          // One-shot mode (Just Ambient): end the session
+          setIsPlaying(false);
+          setSessionComplete(true);
+          ambient.stop();
+          const newStats = recordSession(selectedFocus.focusMin * 60, "focus-" + selectedFocus.id, null);
+          setStats(newStats);
+          return 0;
+        }
+        return t + 1;
+      });
+    }, 1000);
+    return () => clearInterval(focusTimerRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, screen, selectedFocus, focusBlockKind]);
+
+  // Trigger the Headspace-style closing wind-down in the final stretch
+  // of the session. Only for full meditation sessions — breathwork and
+  // focus have their own ends.
+  useEffect(() => {
+    if (isPlaying && screen === "session" && sessionPhase === "practice" && remaining > 0 && remaining <= 22 && prefs.voice) {
+      setSessionPhase("closing");
+      // Cancel any in-flight guidance line so the closing starts clean
+      stopSpeaking();
+      cancelSequenceRef.current = speakSequence(CLOSING_SCRIPT);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remaining, isPlaying, sessionPhase, prefs.voice]);
+  const onPhaseStart = useCallback(phaseName => {
+    // Haptic
+    if (phaseName === "inhale") haptic(10);else if (phaseName === "exhale") haptic([8, 40, 8]);
+    // Spoken breath cue — only during the main practice phase, so we don't
+    // talk over the intro / closing narration.
+    if (sessionPhase !== "practice") return;
+    if (phaseName === "inhale") speakCue("Breathe in");else if (phaseName === "exhale") speakCue("Breathe out");else if (phaseName === "hold" || phaseName === "holdOut") speakCue("Hold");
+  }, [haptic, speakCue, sessionPhase]);
+  const startSession = () => {
+    setIsPlaying(true);
+    setRemaining(selectedDuration.seconds);
+    setGuidanceIndex(0);
+    setGuidanceFade(1);
+    setSessionComplete(false);
+    setMoodChoice(null);
+    setSessionPhase("intro");
+    setScreen("session");
+    ambient.start(selectedCategory.toneConfig, prefs.ambient);
+
+    // iOS Safari requires speechSynthesis.speak to be invoked inside a user
+    // gesture at least once before any subsequent programmatic calls will
+    // produce audio. Prime it here while the tap is still "live".
+    if (prefs.voice && typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        const primer = new SpeechSynthesisUtterance(" ");
+        primer.volume = 0;
+        window.speechSynthesis.speak(primer);
+      } catch {
+        /* noop */
+      }
+    }
+    if (prefs.startBell) setTimeout(() => ambient.bell(), 400);
+    haptic(20);
+
+    // Headspace-style intro: queue the settle-in script, then a per-category
+    // bridge line, then transition to the main practice. If voice is off, we
+    // give the bell a moment and jump straight to practice.
+    if (prefs.voice) {
+      const bridge = CATEGORY_INTRO_BRIDGE[selectedCategory.id];
+      const introLines = [...INTRO_SCRIPT, ...(bridge ? [{
+        text: bridge,
+        pauseAfter: 3
+      }] : [])];
+      // Pre-warm voice pack buffers in the background.
+      if (voicePack.available) {
+        const upcoming = [...introLines.map(l => l.text), ...selectedCategory.guidance, ...CLOSING_SCRIPT.map(l => l.text), "Breathe in", "Hold", "Breathe out"];
+        upcoming.forEach(t => voicePack.prefetch?.(t));
+      }
+
+      // Simple async loop with explicit cancellation flag. Replaces the
+      // old speakSequence cancel-handle pattern which had too many race
+      // conditions (resolver getting interrupted, handle cancelled at
+      // unexpected times, etc).
+      const introState = {
+        cancelled: false
+      };
+      cancelSequenceRef.current = () => {
+        dlog("warn", "intro: cancelled");
+        introState.cancelled = true;
+      };
+      const playIntro = async () => {
+        dlog("log", "intro: starting (" + introLines.length + " lines)");
+        for (let i = 0; i < introLines.length; i++) {
+          if (introState.cancelled) {
+            dlog("warn", "intro: stopped at line " + i);
+            return;
+          }
+          const {
+            text,
+            pauseAfter = 1.5
+          } = introLines[i];
+          dlog("log", "intro line " + (i + 1) + "/" + introLines.length + ":", text.slice(0, 30));
+          try {
+            await speak(text);
+          } catch (e) {
+            dlog("error", "intro: speak threw at line " + (i + 1), e);
+          }
+          if (introState.cancelled) return;
+          dlog("log", "intro: line " + (i + 1) + " done, pausing " + pauseAfter + "s");
+          await new Promise(r => setTimeout(r, pauseAfter * 1000));
+        }
+        if (introState.cancelled) return;
+        dlog("log", "intro: complete → practice");
+        setSessionPhase("practice");
+        await new Promise(r => setTimeout(r, 600));
+        if (introState.cancelled) return;
+        speak(selectedCategory.guidance[0]);
+      };
+
+      // Slight delay so the opening bell rings before the first line.
+      setTimeout(() => {
+        if (!introState.cancelled) playIntro();
+      }, 2200);
+    } else {
+      // No voice — just give a short settle moment, then start the practice
+      setTimeout(() => setSessionPhase("practice"), 6000);
+    }
+  };
+
+  // Quick-reset: pick a duration and a sensible default category, skip pickers
+  const startQuickReset = seconds => {
+    const cat = selectedCategory || CATEGORIES.find(c => c.id === "relax");
+    setSelectedCategory(cat);
+    setSelectedDuration({
+      label: `${Math.round(seconds / 60)} min`,
+      seconds
+    });
+    setIsPlaying(true);
+    setRemaining(seconds);
+    setGuidanceIndex(0);
+    setGuidanceFade(1);
+    setSessionComplete(false);
+    setMoodChoice(null);
+    setSessionPhase("practice"); // no intro for quick resets
+    setScreen("session");
+    ambient.start(cat.toneConfig, prefs.ambient);
+    if (prefs.startBell) setTimeout(() => ambient.bell(), 400);
+    if (prefs.voice) setTimeout(() => speak(cat.guidance[0]), 1200);
+    haptic(15);
+  };
+
+  // SOS panic button: immediate box breathing with reassurance line
+  const startSOS = () => {
+    setSelectedBreathwork(SOS_TECHNIQUE);
+    setBreathworkMinutes(SOS_DURATION_SECONDS / 60);
+    setIsPlaying(true);
+    setRemaining(SOS_DURATION_SECONDS);
+    setSessionComplete(false);
+    setScreen("breathwork-session");
+    ambient.start(SOS_TECHNIQUE.toneConfig, "none");
+    if (prefs.voice && typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        const primer = new SpeechSynthesisUtterance(" ");
+        primer.volume = 0;
+        window.speechSynthesis.speak(primer);
+      } catch {
+        /* noop */
+      }
+    }
+    if (prefs.startBell) setTimeout(() => ambient.bell(), 300);
+    if (prefs.voice) setTimeout(() => speak(SOS_OPENING_LINE), 1400);
+    haptic([10, 60, 10]);
+  };
+
+  // Generic breathwork session launcher
+  const startBreathwork = (technique, minutes) => {
+    const secs = Math.round((minutes || technique.defaultMinutes) * 60);
+    setSelectedBreathwork(technique);
+    setBreathworkMinutes(minutes || technique.defaultMinutes);
+    setIsPlaying(true);
+    setRemaining(secs);
+    setSessionComplete(false);
+    setScreen("breathwork-session");
+    ambient.start(technique.toneConfig, "none");
+    if (prefs.voice && typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        const primer = new SpeechSynthesisUtterance(" ");
+        primer.volume = 0;
+        window.speechSynthesis.speak(primer);
+      } catch {
+        /* noop */
+      }
+    }
+    if (prefs.startBell) setTimeout(() => ambient.bell(), 300);
+    haptic(15);
+  };
+
+  // Focus mode launcher
+  const startFocus = preset => {
+    setSelectedFocus(preset);
+    setFocusElapsed(0);
+    setFocusBlockKind("focus");
+    setFocusBlockIndex(0);
+    setIsPlaying(true);
+    setScreen("focus-session");
+    ambient.start({
+      note: preset.note,
+      fifth: preset.fifth,
+      filterFreq: preset.filterFreq
+    }, preset.soundscape);
+    if (prefs.startBell) setTimeout(() => ambient.bell(), 300);
+    haptic(12);
+  };
+
+  // Wake Up routine launcher
+  const startWakeUp = () => {
+    setWakeUpStage("opening");
+    wakeUpStartRef.current = Date.now();
+    setIsPlaying(true);
+    setRemaining(WAKE_UP_SEQUENCE.totalSeconds);
+    setSessionComplete(false);
+    setScreen("wakeup-session");
+    ambient.start(WAKE_UP_SEQUENCE.toneConfig, "none");
+    if (prefs.voice && typeof window !== "undefined" && "speechSynthesis" in window) {
+      try {
+        const primer = new SpeechSynthesisUtterance(" ");
+        primer.volume = 0;
+        window.speechSynthesis.speak(primer);
+      } catch {
+        /* noop */
+      }
+    }
+    if (prefs.startBell) setTimeout(() => ambient.bell(), 300);
+    haptic(20);
+    // Queue the opening lines, then breath, then intention, then closing
+    if (prefs.voice) {
+      setTimeout(() => {
+        cancelSequenceRef.current = speakSequence(WAKE_UP_SEQUENCE.openingLines, () => {
+          setWakeUpStage("breath");
+          cancelSequenceRef.current = speakSequence(WAKE_UP_SEQUENCE.bridge, () => {
+            // breath segment runs visually; advance to intention after it
+            const cycleTime = (WAKE_UP_SEQUENCE.breathPattern.inhale + WAKE_UP_SEQUENCE.breathPattern.hold + WAKE_UP_SEQUENCE.breathPattern.exhale + WAKE_UP_SEQUENCE.breathPattern.holdOut) * WAKE_UP_SEQUENCE.breathCycles * 1000;
+            setTimeout(() => {
+              setWakeUpStage("intention");
+              cancelSequenceRef.current = speakSequence(WAKE_UP_SEQUENCE.intentionLines, () => {
+                setWakeUpStage("closing");
+                cancelSequenceRef.current = speakSequence(WAKE_UP_SEQUENCE.closingLines, () => {
+                  ambient.bell();
+                  setWakeUpStage("done");
+                  setSessionComplete(true);
+                  setIsPlaying(false);
+                  ambient.stop();
+                  const newStats = recordSession(WAKE_UP_SEQUENCE.totalSeconds, "wakeup-routine", null);
+                  setStats(newStats);
+                });
+              });
+            }, cycleTime);
+          });
+        });
+      }, 1800);
+    }
+  };
+
+  // Universal stop — handles all session types
+  const stopSession = () => {
+    setIsPlaying(false);
+    // Hard-kill: immediate audio cutoff with no fade + suspends the Tone
+    // audio context so iOS Safari fully releases the audio session.
+    // Fixes the "drone keeps playing after I close the app" bug.
+    ambient.hardKill();
+    stopSpeaking();
+    cancelSequenceRef.current?.();
+    cancelSequenceRef.current = null;
+    setSessionPhase("practice");
+    setScreen("home");
+    setSelectedCategory(null);
+    setSelectedDuration(null);
+    setSelectedBreathwork(null);
+    setSelectedFocus(null);
+    setSessionComplete(false);
+    setMoodChoice(null);
+    setWakeUpStage("opening");
+    clearInterval(focusTimerRef.current);
+  };
+  const pauseResume = () => {
+    if (isPlaying) {
+      setIsPlaying(false);
+      ambient.pause();
+      stopSpeaking();
+      cancelSequenceRef.current?.();
+      cancelSequenceRef.current = null;
+      // If we were paused during the intro, jump to practice on resume so
+      // we don't restart the whole script.
+      if (sessionPhase === "intro") setSessionPhase("practice");
+      haptic(8);
+    } else {
+      setIsPlaying(true);
+      ambient.start(selectedCategory.toneConfig, prefs.ambient);
+      haptic(12);
+    }
+  };
+  const saveMood = mood => {
+    setMoodChoice(mood);
+    haptic(10);
+    // Update last history entry with mood
+    try {
+      const history = safeStorage.get(HISTORY_KEY, []);
+      if (history.length) {
+        history[0].mood = mood;
+        safeStorage.set(HISTORY_KEY, history);
+      }
+    } catch {
+      /* noop */
+    }
+  };
+
+  // ─── Render ────────────────────────────────────────────────────
+  const bg = "linear-gradient(160deg, #0a0a0f 0%, #111118 40%, #0d0d14 100%)";
+  const fontStack = "-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', system-ui, sans-serif";
+
+  // Global styles + iOS meta
+  const globalStyles = /*#__PURE__*/_jsx(_Fragment, {
+    children: /*#__PURE__*/_jsx("style", {
+      children: `
+        * { -webkit-tap-highlight-color: transparent; }
+        html, body { margin: 0; padding: 0; background: #0a0a0f; overscroll-behavior: none; }
+        button { touch-action: manipulation; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes floatIn { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+        .cat-card:active { transform: scale(0.97); }
+        .btn-soft:active { transform: scale(0.96); opacity: 0.85; }
+      `
+    })
+  });
+
+  // What's the "active" thing we just finished? Used by the completion
+  // screen so it can show the right label, icon, and color for breathwork,
+  // wake-up, and focus runs as well as plain meditation.
+  const activeRun = screen === "breathwork-session" && selectedBreathwork ? {
+    icon: selectedBreathwork.icon,
+    label: selectedBreathwork.label,
+    color: selectedBreathwork.color,
+    subtitle: `${Math.round(breathworkMinutes)} min · breathwork`,
+    showMood: false
+  } : screen === "wakeup-session" ? {
+    icon: WAKE_UP_SEQUENCE.icon,
+    label: WAKE_UP_SEQUENCE.label,
+    color: WAKE_UP_COLOR,
+    subtitle: WAKE_UP_SEQUENCE.description,
+    showMood: false
+  } : screen === "focus-session" && selectedFocus ? {
+    icon: selectedFocus.icon,
+    label: selectedFocus.label,
+    color: selectedFocus.color,
+    subtitle: selectedFocus.description,
+    showMood: false
+  } : selectedCategory && selectedDuration ? {
+    icon: selectedCategory.icon,
+    label: selectedCategory.label,
+    color: selectedCategory.color,
+    subtitle: `${selectedDuration.label} · ${selectedCategory.label}`,
+    showMood: true
+  } : null;
+
+  // ─── Session Complete ────────────────────────────────────────
+  if (sessionComplete && activeRun && (screen === "session" || screen === "breathwork-session" || screen === "wakeup-session" || screen === "focus-session")) {
+    return /*#__PURE__*/_jsxs("div", {
+      style: {
+        minHeight: "100vh",
+        background: bg,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "calc(32px + env(safe-area-inset-top)) 28px calc(32px + env(safe-area-inset-bottom))",
+        fontFamily: fontStack
+      },
+      children: [globalStyles, /*#__PURE__*/_jsx("div", {
+        style: {
+          fontSize: 56,
+          marginBottom: 12,
+          opacity: 0.85,
+          animation: "fadeIn 0.8s ease"
+        },
+        children: activeRun.icon
+      }), /*#__PURE__*/_jsx("h2", {
+        style: {
+          color: activeRun.color,
+          fontSize: 24,
+          fontWeight: 300,
+          letterSpacing: 6,
+          marginBottom: 10,
+          textTransform: "uppercase",
+          animation: "fadeIn 0.8s ease"
+        },
+        children: "Session Complete"
+      }), /*#__PURE__*/_jsx("p", {
+        style: {
+          color: "#ffffff55",
+          fontSize: 14,
+          letterSpacing: 2,
+          marginBottom: 24
+        },
+        children: activeRun.subtitle
+      }), /*#__PURE__*/_jsx("p", {
+        style: {
+          color: "#ffffff80",
+          fontSize: 17,
+          fontStyle: "italic",
+          maxWidth: 320,
+          textAlign: "center",
+          lineHeight: 1.7,
+          marginBottom: 32,
+          fontFamily: "'Georgia', 'Cormorant Garamond', serif"
+        },
+        children: "\"Carry this stillness with you.\""
+      }), stats && /*#__PURE__*/_jsxs("div", {
+        style: {
+          display: "flex",
+          gap: 28,
+          marginBottom: 32,
+          animation: "fadeIn 1s ease"
+        },
+        children: [/*#__PURE__*/_jsx(Stat, {
+          label: "Streak",
+          value: `${stats.streak}d`,
+          color: activeRun.color
+        }), /*#__PURE__*/_jsx(Stat, {
+          label: "Sessions",
+          value: stats.totalSessions,
+          color: activeRun.color
+        }), /*#__PURE__*/_jsx(Stat, {
+          label: "Minutes",
+          value: stats.totalMinutes,
+          color: activeRun.color
+        })]
+      }), activeRun.showMood && /*#__PURE__*/_jsxs("div", {
+        style: {
+          width: "100%",
+          maxWidth: 340,
+          marginBottom: 28
+        },
+        children: [/*#__PURE__*/_jsx("p", {
+          style: {
+            color: "#ffffff50",
+            fontSize: 11,
+            letterSpacing: 3,
+            textTransform: "uppercase",
+            textAlign: "center",
+            marginBottom: 14
+          },
+          children: "How do you feel?"
+        }), /*#__PURE__*/_jsx("div", {
+          style: {
+            display: "flex",
+            justifyContent: "center",
+            gap: 8,
+            flexWrap: "wrap"
+          },
+          children: MOODS.map(m => {
+            const active = moodChoice === m.label;
+            return /*#__PURE__*/_jsxs("button", {
+              className: "btn-soft",
+              onClick: () => saveMood(m.label),
+              style: {
+                background: active ? `${activeRun.color}22` : "#ffffff06",
+                border: `1px solid ${active ? activeRun.color + "55" : "#ffffff10"}`,
+                padding: "10px 14px",
+                borderRadius: 18,
+                fontSize: 13,
+                color: active ? activeRun.color : "#ffffff90",
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                transition: "all 0.2s ease"
+              },
+              children: [/*#__PURE__*/_jsx("span", {
+                style: {
+                  fontSize: 16
+                },
+                children: m.emoji
+              }), /*#__PURE__*/_jsx("span", {
+                style: {
+                  letterSpacing: 1
+                },
+                children: m.label
+              })]
+            }, m.label);
+          })
+        })]
+      }), /*#__PURE__*/_jsx("button", {
+        className: "btn-soft",
+        onClick: stopSession,
+        style: {
+          background: `${activeRun.color}20`,
+          border: `1px solid ${activeRun.color}40`,
+          color: activeRun.color,
+          padding: "14px 40px",
+          borderRadius: 40,
+          fontSize: 13,
+          letterSpacing: 3,
+          textTransform: "uppercase",
+          cursor: "pointer",
+          fontWeight: 500,
+          transition: "all 0.3s ease"
+        },
+        children: "Return Home"
+      })]
+    });
+  }
+
+  // ─── Active Session ──────────────────────────────────────────
+  if (screen === "session" && selectedCategory) {
+    const sessionProgress = selectedDuration ? 1 - remaining / selectedDuration.seconds : 0;
+    return /*#__PURE__*/_jsxs("div", {
+      style: {
+        minHeight: "100vh",
+        background: bg,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom))",
+        position: "relative",
+        fontFamily: fontStack,
+        overflow: "hidden"
+      },
+      children: [globalStyles, /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "fixed",
+          top: "-30%",
+          left: "-20%",
+          width: "140%",
+          height: "140%",
+          background: `radial-gradient(ellipse at 50% 40%, ${selectedCategory.color}10, transparent 60%)`,
+          pointerEvents: "none"
+        }
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "absolute",
+          top: "calc(24px + env(safe-area-inset-top))",
+          left: 0,
+          right: 0,
+          textAlign: "center"
+        },
+        children: /*#__PURE__*/_jsxs("span", {
+          style: {
+            color: selectedCategory.color,
+            fontSize: 11,
+            letterSpacing: 5,
+            textTransform: "uppercase",
+            opacity: 0.65
+          },
+          children: [selectedCategory.icon, "  ", selectedCategory.label, sessionPhase === "intro" && " · Settling In", sessionPhase === "closing" && " · Closing"]
+        })
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          minHeight: 70,
+          display: "flex",
+          alignItems: "center",
+          marginBottom: 20,
+          padding: "0 24px"
+        },
+        children: sessionPhase === "practice" ? /*#__PURE__*/_jsx("p", {
+          style: {
+            color: "#ffffff95",
+            fontSize: 17,
+            fontStyle: "italic",
+            textAlign: "center",
+            maxWidth: 340,
+            lineHeight: 1.7,
+            opacity: guidanceFade,
+            transition: "opacity 0.8s ease",
+            letterSpacing: 0.3,
+            fontFamily: "'Georgia', serif"
+          },
+          children: selectedCategory.guidance[guidanceIndex]
+        }) : /*#__PURE__*/_jsx("p", {
+          style: {
+            color: `${selectedCategory.color}90`,
+            fontSize: 13,
+            letterSpacing: 4,
+            textTransform: "uppercase",
+            textAlign: "center",
+            maxWidth: 340,
+            lineHeight: 1.7,
+            opacity: 0.75,
+            fontWeight: 300
+          },
+          children: sessionPhase === "intro" ? "Settling in…" : "Coming back…"
+        })
+      }), /*#__PURE__*/_jsxs("div", {
+        style: {
+          position: "relative",
+          width: 280,
+          height: 280,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center"
+        },
+        children: [/*#__PURE__*/_jsx(ProgressRing, {
+          progress: sessionProgress,
+          color: selectedCategory.color,
+          size: 280
+        }), /*#__PURE__*/_jsx(BreathingCircle, {
+          pattern: selectedCategory.breathPattern,
+          color: selectedCategory.color,
+          isActive: isPlaying,
+          reducedMotion: reducedMotion,
+          onPhaseStart: onPhaseStart
+        })]
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          marginTop: 24
+        },
+        children: /*#__PURE__*/_jsx(TimerDisplay, {
+          remaining: remaining,
+          color: selectedCategory.color
+        })
+      }), /*#__PURE__*/_jsxs("div", {
+        style: {
+          display: "flex",
+          gap: 18,
+          marginTop: 32
+        },
+        children: [/*#__PURE__*/_jsx("button", {
+          className: "btn-soft",
+          onClick: pauseResume,
+          "aria-label": isPlaying ? "Pause" : "Resume",
+          style: {
+            background: `${selectedCategory.color}18`,
+            border: `1px solid ${selectedCategory.color}40`,
+            color: selectedCategory.color,
+            width: 60,
+            height: 60,
+            borderRadius: "50%",
+            fontSize: 20,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            transition: "all 0.3s ease"
+          },
+          children: isPlaying ? "⏸" : "▶"
+        }), /*#__PURE__*/_jsx("button", {
+          className: "btn-soft",
+          onClick: stopSession,
+          "aria-label": "End session",
+          style: {
+            background: "#ffffff08",
+            border: "1px solid #ffffff18",
+            color: "#ffffff70",
+            width: 60,
+            height: 60,
+            borderRadius: "50%",
+            fontSize: 16,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            transition: "all 0.3s ease"
+          },
+          children: "\u2715"
+        })]
+      })]
+    });
+  }
+
+  // ─── Breathwork: technique-options picker ─────────────────────
+  if (screen === "breathwork-pick" && selectedBreathwork) {
+    const t = selectedBreathwork;
+    return /*#__PURE__*/_jsxs("div", {
+      style: {
+        minHeight: "100vh",
+        background: bg,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "calc(60px + env(safe-area-inset-top)) 24px calc(40px + env(safe-area-inset-bottom))",
+        fontFamily: fontStack,
+        position: "relative"
+      },
+      children: [globalStyles, /*#__PURE__*/_jsx("button", {
+        className: "btn-soft",
+        onClick: () => {
+          setScreen("home");
+          setSelectedBreathwork(null);
+        },
+        style: {
+          position: "absolute",
+          top: "calc(20px + env(safe-area-inset-top))",
+          left: 16,
+          background: "none",
+          border: "none",
+          color: "#ffffff55",
+          fontSize: 13,
+          cursor: "pointer",
+          letterSpacing: 2,
+          padding: "10px 14px"
+        },
+        children: "\u2190 BACK"
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          fontSize: 48,
+          marginBottom: 14,
+          color: t.color,
+          opacity: 0.85
+        },
+        children: t.icon
+      }), /*#__PURE__*/_jsx("h2", {
+        style: {
+          color: t.color,
+          fontSize: 20,
+          fontWeight: 300,
+          letterSpacing: 5,
+          textTransform: "uppercase",
+          marginBottom: 6,
+          textAlign: "center"
+        },
+        children: t.label
+      }), /*#__PURE__*/_jsx("p", {
+        style: {
+          color: "#ffffff55",
+          fontSize: 14,
+          lineHeight: 1.6,
+          maxWidth: 320,
+          textAlign: "center",
+          marginBottom: 32
+        },
+        children: t.description
+      }), /*#__PURE__*/_jsx("p", {
+        style: {
+          color: "#ffffff50",
+          fontSize: 11,
+          letterSpacing: 4,
+          textTransform: "uppercase",
+          marginBottom: 14
+        },
+        children: "Duration"
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          display: "grid",
+          gridTemplateColumns: "repeat(4, 1fr)",
+          gap: 8,
+          maxWidth: 320,
+          width: "100%",
+          marginBottom: 32
+        },
+        children: [1, 2, 3, 5, 7, 10, 15, 20].map(min => {
+          const active = breathworkMinutes === min;
+          return /*#__PURE__*/_jsxs("button", {
+            className: "btn-soft",
+            onClick: () => setBreathworkMinutes(min),
+            style: {
+              background: active ? `${t.color}25` : "#ffffff06",
+              border: `1px solid ${active ? t.color + "60" : "#ffffff12"}`,
+              color: active ? t.color : "#ffffff80",
+              padding: "12px 4px",
+              borderRadius: 14,
+              fontSize: 13,
+              cursor: "pointer",
+              fontWeight: 400
+            },
+            children: [min, "m"]
+          }, min);
+        })
+      }), /*#__PURE__*/_jsx("button", {
+        className: "btn-soft",
+        onClick: () => startBreathwork(t, breathworkMinutes),
+        style: {
+          background: `linear-gradient(135deg, ${t.color}35, ${t.accent}25)`,
+          border: `1px solid ${t.color}60`,
+          color: t.color,
+          padding: "16px 56px",
+          borderRadius: 40,
+          fontSize: 13,
+          letterSpacing: 4,
+          textTransform: "uppercase",
+          cursor: "pointer",
+          fontWeight: 500,
+          boxShadow: `0 8px 32px ${t.color}25`
+        },
+        children: "Begin"
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          marginTop: 28,
+          color: "#ffffff35",
+          fontSize: 11,
+          letterSpacing: 2,
+          textAlign: "center",
+          lineHeight: 1.6
+        },
+        children: t.custom === "sigh" ? "DOUBLE INHALE · LONG EXHALE" : `${t.pattern.inhale}s IN${t.pattern.hold > 0 ? ` · ${t.pattern.hold}s HOLD` : ""} · ${t.pattern.exhale}s OUT${t.pattern.holdOut > 0 ? ` · ${t.pattern.holdOut}s HOLD` : ""}`
+      })]
+    });
+  }
+
+  // ─── Breathwork: active session ───────────────────────────────
+  if (screen === "breathwork-session" && selectedBreathwork) {
+    const t = selectedBreathwork;
+    const sessionProgress = breathworkMinutes > 0 ? 1 - remaining / (breathworkMinutes * 60) : 0;
+    return /*#__PURE__*/_jsxs("div", {
+      style: {
+        minHeight: "100vh",
+        background: bg,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom))",
+        position: "relative",
+        fontFamily: fontStack,
+        overflow: "hidden"
+      },
+      children: [globalStyles, /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "fixed",
+          top: "-30%",
+          left: "-20%",
+          width: "140%",
+          height: "140%",
+          background: `radial-gradient(ellipse at 50% 40%, ${t.color}12, transparent 60%)`,
+          pointerEvents: "none"
+        }
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "absolute",
+          top: "calc(24px + env(safe-area-inset-top))",
+          left: 0,
+          right: 0,
+          textAlign: "center"
+        },
+        children: /*#__PURE__*/_jsxs("span", {
+          style: {
+            color: t.color,
+            fontSize: 11,
+            letterSpacing: 5,
+            textTransform: "uppercase",
+            opacity: 0.65
+          },
+          children: [t.icon, "  ", t.label]
+        })
+      }), /*#__PURE__*/_jsxs("div", {
+        style: {
+          position: "relative",
+          width: 280,
+          height: 280,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center"
+        },
+        children: [/*#__PURE__*/_jsx(ProgressRing, {
+          progress: sessionProgress,
+          color: t.color,
+          size: 280
+        }), /*#__PURE__*/_jsx(BreathingCircle, {
+          pattern: t.pattern,
+          color: t.color,
+          isActive: isPlaying,
+          reducedMotion: reducedMotion,
+          onPhaseStart: onPhaseStart
+        })]
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          marginTop: 24
+        },
+        children: /*#__PURE__*/_jsx(TimerDisplay, {
+          remaining: remaining,
+          color: t.color
+        })
+      }), /*#__PURE__*/_jsxs("div", {
+        style: {
+          display: "flex",
+          gap: 18,
+          marginTop: 32
+        },
+        children: [/*#__PURE__*/_jsx("button", {
+          className: "btn-soft",
+          onClick: pauseResume,
+          "aria-label": isPlaying ? "Pause" : "Resume",
+          style: {
+            background: `${t.color}18`,
+            border: `1px solid ${t.color}40`,
+            color: t.color,
+            width: 60,
+            height: 60,
+            borderRadius: "50%",
+            fontSize: 20,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center"
+          },
+          children: isPlaying ? "⏸" : "▶"
+        }), /*#__PURE__*/_jsx("button", {
+          className: "btn-soft",
+          onClick: stopSession,
+          "aria-label": "End",
+          style: {
+            background: "#ffffff08",
+            border: "1px solid #ffffff18",
+            color: "#ffffff70",
+            width: 60,
+            height: 60,
+            borderRadius: "50%",
+            fontSize: 16,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center"
+          },
+          children: "\u2715"
+        })]
+      })]
+    });
+  }
+
+  // ─── Focus mode session ───────────────────────────────────────
+  if (screen === "focus-session" && selectedFocus) {
+    const f = selectedFocus;
+    const blockSeconds = (focusBlockKind === "focus" ? f.focusMin : f.breakMin) * 60;
+    const remainingBlock = Math.max(blockSeconds - focusElapsed, 0);
+    const blockProgress = blockSeconds > 0 ? focusElapsed / blockSeconds : 0;
+    return /*#__PURE__*/_jsxs("div", {
+      style: {
+        minHeight: "100vh",
+        background: bg,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom))",
+        position: "relative",
+        fontFamily: fontStack
+      },
+      children: [globalStyles, /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "fixed",
+          top: "-30%",
+          left: "-20%",
+          width: "140%",
+          height: "140%",
+          background: `radial-gradient(ellipse at 50% 40%, ${f.color}10, transparent 60%)`,
+          pointerEvents: "none"
+        }
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "absolute",
+          top: "calc(24px + env(safe-area-inset-top))",
+          left: 0,
+          right: 0,
+          textAlign: "center"
+        },
+        children: /*#__PURE__*/_jsxs("span", {
+          style: {
+            color: f.color,
+            fontSize: 11,
+            letterSpacing: 5,
+            textTransform: "uppercase",
+            opacity: 0.65
+          },
+          children: [f.icon, "  ", f.label, f.repeat ? ` · Block ${focusBlockIndex + 1}` : ""]
+        })
+      }), /*#__PURE__*/_jsxs("div", {
+        style: {
+          position: "relative",
+          width: 280,
+          height: 280,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center"
+        },
+        children: [/*#__PURE__*/_jsx(ProgressRing, {
+          progress: blockProgress,
+          color: f.color,
+          size: 280
+        }), /*#__PURE__*/_jsxs("div", {
+          style: {
+            width: 160,
+            height: 160,
+            borderRadius: "50%",
+            background: `radial-gradient(circle, ${f.color}20, ${f.color}05 70%)`,
+            border: `1px solid ${f.color}30`,
+            animation: "fadeIn 1s ease",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            backdropFilter: "blur(6px)",
+            WebkitBackdropFilter: "blur(6px)"
+          },
+          children: [/*#__PURE__*/_jsx("div", {
+            style: {
+              color: f.color,
+              fontSize: 12,
+              letterSpacing: 4,
+              textTransform: "uppercase",
+              opacity: 0.85,
+              marginBottom: 4
+            },
+            children: focusBlockKind === "focus" ? "Focus" : "Break"
+          }), /*#__PURE__*/_jsxs("div", {
+            style: {
+              fontSize: 30,
+              color: f.color,
+              fontWeight: 200,
+              fontVariantNumeric: "tabular-nums",
+              letterSpacing: 2
+            },
+            children: [Math.floor(remainingBlock / 60), ":", (remainingBlock % 60).toString().padStart(2, "0")]
+          })]
+        })]
+      }), /*#__PURE__*/_jsxs("div", {
+        style: {
+          display: "flex",
+          gap: 18,
+          marginTop: 40
+        },
+        children: [/*#__PURE__*/_jsx("button", {
+          className: "btn-soft",
+          onClick: () => {
+            // Skip to next block
+            ambient.bell();
+            haptic(12);
+            if (focusBlockKind === "focus" && f.breakMin > 0) {
+              setFocusBlockKind("break");
+            } else if (f.repeat) {
+              setFocusBlockKind("focus");
+              setFocusBlockIndex(i => i + 1);
+            }
+            setFocusElapsed(0);
+          },
+          "aria-label": "Skip block",
+          style: {
+            background: `${f.color}18`,
+            border: `1px solid ${f.color}40`,
+            color: f.color,
+            padding: "12px 22px",
+            borderRadius: 24,
+            fontSize: 12,
+            letterSpacing: 3,
+            textTransform: "uppercase",
+            cursor: "pointer",
+            fontWeight: 500
+          },
+          children: "Skip"
+        }), /*#__PURE__*/_jsx("button", {
+          className: "btn-soft",
+          onClick: stopSession,
+          "aria-label": "End focus",
+          style: {
+            background: "#ffffff08",
+            border: "1px solid #ffffff18",
+            color: "#ffffff70",
+            padding: "12px 22px",
+            borderRadius: 24,
+            fontSize: 12,
+            letterSpacing: 3,
+            textTransform: "uppercase",
+            cursor: "pointer",
+            fontWeight: 500
+          },
+          children: "End"
+        })]
+      })]
+    });
+  }
+
+  // ─── Wake Up routine session ──────────────────────────────────
+  if (screen === "wakeup-session") {
+    const w = WAKE_UP_SEQUENCE;
+    const stageLabel = wakeUpStage === "opening" ? "Settling in" : wakeUpStage === "breath" ? "Breathing together" : wakeUpStage === "intention" ? "Setting an intention" : "Closing";
+    return /*#__PURE__*/_jsxs("div", {
+      style: {
+        minHeight: "100vh",
+        background: bg,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom))",
+        position: "relative",
+        fontFamily: fontStack
+      },
+      children: [globalStyles, /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "fixed",
+          top: "-30%",
+          left: "-20%",
+          width: "140%",
+          height: "140%",
+          background: `radial-gradient(ellipse at 50% 40%, ${w.color}15, transparent 60%)`,
+          pointerEvents: "none"
+        }
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "absolute",
+          top: "calc(24px + env(safe-area-inset-top))",
+          left: 0,
+          right: 0,
+          textAlign: "center"
+        },
+        children: /*#__PURE__*/_jsxs("span", {
+          style: {
+            color: w.color,
+            fontSize: 11,
+            letterSpacing: 5,
+            textTransform: "uppercase",
+            opacity: 0.65
+          },
+          children: [w.icon, "  ", w.label, " \xB7 ", stageLabel]
+        })
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          position: "relative",
+          width: 260,
+          height: 260,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center"
+        },
+        children: wakeUpStage === "breath" ? /*#__PURE__*/_jsx(BreathingCircle, {
+          pattern: w.breathPattern,
+          color: w.color,
+          isActive: true,
+          reducedMotion: reducedMotion,
+          onPhaseStart: () => haptic(8)
+        }) : /*#__PURE__*/_jsx("div", {
+          style: {
+            width: 180,
+            height: 180,
+            borderRadius: "50%",
+            background: `radial-gradient(circle, ${w.color}20, ${w.color}05 70%)`,
+            border: `1px solid ${w.color}40`,
+            animation: "fadeIn 1.2s ease"
+          }
+        })
+      }), /*#__PURE__*/_jsxs("p", {
+        style: {
+          color: `${w.color}aa`,
+          fontSize: 14,
+          letterSpacing: 3,
+          textTransform: "uppercase",
+          marginTop: 30,
+          fontWeight: 300
+        },
+        children: [stageLabel, "\u2026"]
+      }), /*#__PURE__*/_jsx("button", {
+        className: "btn-soft",
+        onClick: stopSession,
+        "aria-label": "End wake up",
+        style: {
+          background: "#ffffff08",
+          border: "1px solid #ffffff18",
+          color: "#ffffff70",
+          padding: "12px 28px",
+          borderRadius: 24,
+          fontSize: 12,
+          letterSpacing: 3,
+          textTransform: "uppercase",
+          cursor: "pointer",
+          fontWeight: 500,
+          marginTop: 36
+        },
+        children: "End early"
+      })]
+    });
+  }
+
+  // ─── Duration Picker ─────────────────────────────────────────
+  if (screen === "duration" && selectedCategory) {
+    return /*#__PURE__*/_jsxs("div", {
+      style: {
+        minHeight: "100vh",
+        background: bg,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "calc(60px + env(safe-area-inset-top)) 24px calc(40px + env(safe-area-inset-bottom))",
+        fontFamily: fontStack,
+        position: "relative"
+      },
+      children: [globalStyles, /*#__PURE__*/_jsx("button", {
+        className: "btn-soft",
+        onClick: () => {
+          setScreen("home");
+          setSelectedCategory(null);
+        },
+        style: {
+          position: "absolute",
+          top: "calc(20px + env(safe-area-inset-top))",
+          left: 16,
+          background: "none",
+          border: "none",
+          color: "#ffffff55",
+          fontSize: 13,
+          cursor: "pointer",
+          letterSpacing: 2,
+          padding: "10px 14px"
+        },
+        children: "\u2190 BACK"
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          fontSize: 44,
+          marginBottom: 14,
+          opacity: 0.75
+        },
+        children: selectedCategory.icon
+      }), /*#__PURE__*/_jsx("h2", {
+        style: {
+          color: selectedCategory.color,
+          fontSize: 22,
+          fontWeight: 300,
+          letterSpacing: 6,
+          textTransform: "uppercase",
+          marginBottom: 6
+        },
+        children: selectedCategory.label
+      }), /*#__PURE__*/_jsx("p", {
+        style: {
+          color: "#ffffff45",
+          fontSize: 13,
+          letterSpacing: 2,
+          marginBottom: 40,
+          textAlign: "center"
+        },
+        children: selectedCategory.description
+      }), /*#__PURE__*/_jsx("p", {
+        style: {
+          color: "#ffffff50",
+          fontSize: 11,
+          letterSpacing: 4,
+          textTransform: "uppercase",
+          marginBottom: 18
+        },
+        children: "Choose Duration"
+      }), /*#__PURE__*/_jsx("div", {
+        style: {
+          display: "grid",
+          gridTemplateColumns: "repeat(3, 1fr)",
+          gap: 10,
+          maxWidth: 360,
+          width: "100%",
+          marginBottom: 32
+        },
+        children: DURATIONS.map(d => {
+          const active = selectedDuration?.label === d.label;
+          return /*#__PURE__*/_jsx("button", {
+            className: "btn-soft",
+            onClick: () => setSelectedDuration(d),
+            style: {
+              background: active ? `${selectedCategory.color}25` : "#ffffff06",
+              border: `1px solid ${active ? selectedCategory.color + "60" : "#ffffff12"}`,
+              color: active ? selectedCategory.color : "#ffffff80",
+              padding: "14px 8px",
+              borderRadius: 16,
+              fontSize: 14,
+              letterSpacing: 1,
+              cursor: "pointer",
+              transition: "all 0.25s ease",
+              fontWeight: 400
+            },
+            children: d.label
+          }, d.label);
+        })
+      }), /*#__PURE__*/_jsxs("div", {
+        style: {
+          color: "#ffffff35",
+          fontSize: 11,
+          letterSpacing: 2,
+          textAlign: "center",
+          marginBottom: 32,
+          lineHeight: 1.7
+        },
+        children: ["BREATH \xB7 ", selectedCategory.breathPattern.inhale, "s IN", selectedCategory.breathPattern.hold > 0 && ` · ${selectedCategory.breathPattern.hold}s HOLD`, ` · ${selectedCategory.breathPattern.exhale}s OUT`, selectedCategory.breathPattern.holdOut > 0 && ` · ${selectedCategory.breathPattern.holdOut}s HOLD`]
+      }), selectedDuration && /*#__PURE__*/_jsx("button", {
+        className: "btn-soft",
+        onClick: startSession,
+        style: {
+          background: `linear-gradient(135deg, ${selectedCategory.color}35, ${selectedCategory.accent}25)`,
+          border: `1px solid ${selectedCategory.color}60`,
+          color: selectedCategory.color,
+          padding: "16px 56px",
+          borderRadius: 40,
+          fontSize: 13,
+          letterSpacing: 4,
+          textTransform: "uppercase",
+          cursor: "pointer",
+          transition: "all 0.3s ease",
+          animation: "fadeIn 0.4s ease",
+          fontWeight: 500,
+          boxShadow: `0 8px 32px ${selectedCategory.color}25`
+        },
+        children: "Begin Session"
+      })]
+    });
+  }
+
+  // ─── Home Screen ─────────────────────────────────────────────
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      minHeight: "100vh",
+      background: bg,
+      padding: "calc(36px + env(safe-area-inset-top)) 22px calc(36px + env(safe-area-inset-bottom))",
+      fontFamily: fontStack,
+      position: "relative"
+    },
+    children: [globalStyles, /*#__PURE__*/_jsx("button", {
+      className: "btn-soft",
+      onClick: startSOS,
+      "aria-label": "SOS \u2014 instant calm",
+      style: {
+        position: "absolute",
+        top: "calc(28px + env(safe-area-inset-top))",
+        left: 18,
+        background: "linear-gradient(135deg, #E07A7A30, #C9666622)",
+        border: "1px solid #E07A7A55",
+        width: 56,
+        height: 40,
+        borderRadius: 20,
+        color: "#E07A7A",
+        fontSize: 12,
+        fontWeight: 600,
+        letterSpacing: 2,
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        boxShadow: "0 4px 16px #E07A7A20"
+      },
+      children: "SOS"
+    }), /*#__PURE__*/_jsx("button", {
+      className: "btn-soft",
+      onClick: () => setShowSettings(true),
+      "aria-label": "Settings",
+      style: {
+        position: "absolute",
+        top: "calc(28px + env(safe-area-inset-top))",
+        right: 18,
+        background: "#ffffff06",
+        border: "1px solid #ffffff10",
+        width: 40,
+        height: 40,
+        borderRadius: "50%",
+        color: "#ffffff70",
+        fontSize: 16,
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center"
+      },
+      children: "\u2699"
+    }), /*#__PURE__*/_jsx("button", {
+      className: "btn-soft",
+      onClick: () => {
+        ambient.hardKill();
+        stopSpeaking();
+        cancelSequenceRef.current?.();
+        cancelSequenceRef.current = null;
+      },
+      "aria-label": "Stop all sound",
+      style: {
+        position: "absolute",
+        top: "calc(28px + env(safe-area-inset-top))",
+        right: 66,
+        background: "#ffffff06",
+        border: "1px solid #ffffff10",
+        width: 40,
+        height: 40,
+        borderRadius: "50%",
+        color: "#ffffff70",
+        fontSize: 16,
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center"
+      },
+      title: "Stop all sound",
+      children: "\u2298"
+    }), /*#__PURE__*/_jsx("button", {
+      className: "btn-soft",
+      onClick: () => setShowDebug(v => !v),
+      "aria-label": "Debug log",
+      style: {
+        position: "absolute",
+        top: "calc(28px + env(safe-area-inset-top))",
+        right: 114,
+        background: "#ffffff06",
+        border: "1px solid #ffffff10",
+        width: 40,
+        height: 40,
+        borderRadius: "50%",
+        color: "#ffffff70",
+        fontSize: 13,
+        letterSpacing: 1,
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontFamily: "ui-monospace, monospace"
+      },
+      title: "Debug log",
+      children: "\u203A_"
+    }), /*#__PURE__*/_jsx(DebugOverlay, {
+      open: showDebug,
+      onClose: () => setShowDebug(false)
+    }), /*#__PURE__*/_jsxs("div", {
+      style: {
+        textAlign: "center",
+        marginBottom: 36,
+        animation: "fadeIn 0.9s ease"
+      },
+      children: [/*#__PURE__*/_jsx("div", {
+        style: {
+          fontSize: 10,
+          letterSpacing: 6,
+          textTransform: "uppercase",
+          color: "#ffffff25",
+          marginBottom: 14
+        },
+        children: "\u2500\u2500 Daily Practice \u2500\u2500"
+      }), /*#__PURE__*/_jsxs("h1", {
+        style: {
+          fontSize: 34,
+          fontWeight: 200,
+          color: "#ffffff95",
+          letterSpacing: 8,
+          textTransform: "uppercase",
+          margin: 0,
+          lineHeight: 1.2
+        },
+        children: ["Still", /*#__PURE__*/_jsx("span", {
+          style: {
+            color: "#85CDCA"
+          },
+          children: "ness"
+        })]
+      }), /*#__PURE__*/_jsx("p", {
+        style: {
+          color: "#ffffff30",
+          fontSize: 13,
+          letterSpacing: 3,
+          marginTop: 10
+        },
+        children: "breathe \xB7 ground \xB7 be"
+      })]
+    }), stats && stats.totalSessions > 0 && /*#__PURE__*/_jsxs("div", {
+      style: {
+        display: "flex",
+        justifyContent: "center",
+        gap: 24,
+        marginBottom: 32,
+        padding: "16px 20px",
+        background: "#ffffff04",
+        border: "1px solid #ffffff08",
+        borderRadius: 18,
+        maxWidth: 360,
+        margin: "0 auto 32px",
+        animation: "fadeIn 1s ease"
+      },
+      children: [/*#__PURE__*/_jsx(Stat, {
+        label: "Streak",
+        value: `${stats.streak}d`,
+        color: "#85CDCA"
+      }), /*#__PURE__*/_jsx(Stat, {
+        label: "Sessions",
+        value: stats.totalSessions,
+        color: "#85CDCA"
+      }), /*#__PURE__*/_jsx(Stat, {
+        label: "Minutes",
+        value: stats.totalMinutes,
+        color: "#85CDCA"
+      })]
+    }), /*#__PURE__*/_jsxs("div", {
+      style: {
+        display: "flex",
+        gap: 10,
+        justifyContent: "center",
+        marginBottom: 22,
+        maxWidth: 420,
+        margin: "0 auto 22px"
+      },
+      children: [/*#__PURE__*/_jsx("div", {
+        style: {
+          color: "#ffffff35",
+          fontSize: 10,
+          letterSpacing: 3,
+          textTransform: "uppercase",
+          alignSelf: "center",
+          marginRight: 6
+        },
+        children: "Quick reset"
+      }), QUICK_DURATIONS.map(d => /*#__PURE__*/_jsx("button", {
+        className: "btn-soft",
+        onClick: () => startQuickReset(d.seconds),
+        style: {
+          background: "#ffffff08",
+          border: "1px solid #ffffff15",
+          color: "#ffffff90",
+          padding: "8px 18px",
+          borderRadius: 16,
+          fontSize: 12,
+          letterSpacing: 1.5,
+          cursor: "pointer",
+          fontWeight: 500
+        },
+        children: d.label
+      }, d.label))]
+    }), /*#__PURE__*/_jsx("div", {
+      style: {
+        display: "flex",
+        gap: 6,
+        justifyContent: "center",
+        marginBottom: 22,
+        maxWidth: 420,
+        margin: "0 auto 24px",
+        overflowX: "auto",
+        padding: "4px 0"
+      },
+      children: [{
+        id: "meditate",
+        label: "Meditate",
+        color: "#85CDCA"
+      }, {
+        id: "breathe",
+        label: "Breathe",
+        color: "#88AED0"
+      }, {
+        id: "focus",
+        label: "Focus",
+        color: "#7FA8C9"
+      }, {
+        id: "wakeup",
+        label: "Wake Up",
+        color: WAKE_UP_COLOR
+      }].map(m => {
+        const active = homeMode === m.id;
+        return /*#__PURE__*/_jsx("button", {
+          className: "btn-soft",
+          onClick: () => {
+            setHomeMode(m.id);
+            haptic(6);
+          },
+          style: {
+            background: active ? `${m.color}25` : "transparent",
+            border: `1px solid ${active ? m.color + "60" : "#ffffff10"}`,
+            color: active ? m.color : "#ffffff70",
+            padding: "8px 16px",
+            borderRadius: 18,
+            fontSize: 12,
+            letterSpacing: 2,
+            textTransform: "uppercase",
+            cursor: "pointer",
+            fontWeight: 500,
+            whiteSpace: "nowrap",
+            transition: "all 0.25s ease"
+          },
+          children: m.label
+        }, m.id);
+      })
+    }), homeMode === "meditate" && /*#__PURE__*/_jsx("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "repeat(2, 1fr)",
+        gap: 12,
+        maxWidth: 420,
+        margin: "0 auto"
+      },
+      children: CATEGORIES.map((cat, i) => /*#__PURE__*/_jsxs("div", {
+        className: "cat-card",
+        onClick: () => {
+          setSelectedCategory(cat);
+          setSelectedDuration(null);
+          setScreen("duration");
+          haptic(8);
+        },
+        style: {
+          background: `linear-gradient(150deg, ${cat.color}08, ${cat.color}02)`,
+          border: `1px solid ${cat.color}18`,
+          borderRadius: 20,
+          padding: "26px 18px",
+          cursor: "pointer",
+          transition: "all 0.3s ease",
+          animation: `floatIn ${0.4 + i * 0.07}s ease`,
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          textAlign: "center",
+          gap: 10,
+          minHeight: 130,
+          justifyContent: "center"
+        },
+        children: [/*#__PURE__*/_jsx("span", {
+          style: {
+            fontSize: 30,
+            opacity: 0.85,
+            color: cat.color
+          },
+          children: cat.icon
+        }), /*#__PURE__*/_jsx("span", {
+          style: {
+            color: cat.color,
+            fontSize: 13,
+            letterSpacing: 3,
+            textTransform: "uppercase",
+            fontWeight: 500
+          },
+          children: cat.label
+        }), /*#__PURE__*/_jsx("span", {
+          style: {
+            color: "#ffffff40",
+            fontSize: 11,
+            letterSpacing: 0.5,
+            lineHeight: 1.4
+          },
+          children: cat.description
+        })]
+      }, cat.id))
+    }), homeMode === "breathe" && /*#__PURE__*/_jsx("div", {
+      style: {
+        display: "flex",
+        flexDirection: "column",
+        gap: 10,
+        maxWidth: 420,
+        margin: "0 auto"
+      },
+      children: BREATHWORK.map((tech, i) => /*#__PURE__*/_jsxs("div", {
+        className: "cat-card",
+        onClick: () => {
+          setSelectedBreathwork(tech);
+          setBreathworkMinutes(tech.defaultMinutes);
+          setScreen("breathwork-pick");
+          haptic(8);
+        },
+        style: {
+          background: `linear-gradient(135deg, ${tech.color}10, ${tech.color}03)`,
+          border: `1px solid ${tech.color}22`,
+          borderRadius: 18,
+          padding: "16px 18px",
+          cursor: "pointer",
+          transition: "all 0.3s ease",
+          animation: `floatIn ${0.4 + i * 0.06}s ease`,
+          display: "flex",
+          alignItems: "center",
+          gap: 14
+        },
+        children: [/*#__PURE__*/_jsx("span", {
+          style: {
+            fontSize: 24,
+            color: tech.color,
+            width: 36,
+            textAlign: "center"
+          },
+          children: tech.icon
+        }), /*#__PURE__*/_jsxs("div", {
+          style: {
+            flex: 1,
+            minWidth: 0
+          },
+          children: [/*#__PURE__*/_jsx("div", {
+            style: {
+              color: tech.color,
+              fontSize: 14,
+              letterSpacing: 2,
+              textTransform: "uppercase",
+              fontWeight: 500
+            },
+            children: tech.label
+          }), /*#__PURE__*/_jsx("div", {
+            style: {
+              color: "#ffffff45",
+              fontSize: 11,
+              letterSpacing: 0.5,
+              marginTop: 3
+            },
+            children: tech.short
+          })]
+        }), /*#__PURE__*/_jsx("span", {
+          style: {
+            color: "#ffffff30",
+            fontSize: 14
+          },
+          children: "\u203A"
+        })]
+      }, tech.id))
+    }), homeMode === "focus" && /*#__PURE__*/_jsx("div", {
+      style: {
+        display: "flex",
+        flexDirection: "column",
+        gap: 10,
+        maxWidth: 420,
+        margin: "0 auto"
+      },
+      children: FOCUS_PRESETS.map((preset, i) => /*#__PURE__*/_jsxs("div", {
+        className: "cat-card",
+        onClick: () => {
+          startFocus(preset);
+        },
+        style: {
+          background: `linear-gradient(135deg, ${preset.color}10, ${preset.color}03)`,
+          border: `1px solid ${preset.color}22`,
+          borderRadius: 18,
+          padding: "18px 20px",
+          cursor: "pointer",
+          transition: "all 0.3s ease",
+          animation: `floatIn ${0.4 + i * 0.06}s ease`,
+          display: "flex",
+          alignItems: "center",
+          gap: 14
+        },
+        children: [/*#__PURE__*/_jsx("span", {
+          style: {
+            fontSize: 22,
+            color: preset.color,
+            width: 32
+          },
+          children: preset.icon
+        }), /*#__PURE__*/_jsxs("div", {
+          style: {
+            flex: 1,
+            minWidth: 0
+          },
+          children: [/*#__PURE__*/_jsx("div", {
+            style: {
+              color: preset.color,
+              fontSize: 14,
+              letterSpacing: 2,
+              textTransform: "uppercase",
+              fontWeight: 500
+            },
+            children: preset.label
+          }), /*#__PURE__*/_jsx("div", {
+            style: {
+              color: "#ffffff45",
+              fontSize: 11,
+              letterSpacing: 0.5,
+              marginTop: 3
+            },
+            children: preset.description
+          })]
+        }), /*#__PURE__*/_jsx("span", {
+          style: {
+            color: "#ffffff30",
+            fontSize: 14
+          },
+          children: "\u203A"
+        })]
+      }, preset.id))
+    }), homeMode === "wakeup" && /*#__PURE__*/_jsx("div", {
+      style: {
+        maxWidth: 420,
+        margin: "0 auto"
+      },
+      children: /*#__PURE__*/_jsxs("div", {
+        className: "cat-card",
+        onClick: startWakeUp,
+        style: {
+          background: `linear-gradient(150deg, ${WAKE_UP_COLOR}18, ${WAKE_UP_COLOR}04)`,
+          border: `1px solid ${WAKE_UP_COLOR}40`,
+          borderRadius: 22,
+          padding: "32px 22px",
+          cursor: "pointer",
+          transition: "all 0.3s ease",
+          animation: "floatIn 0.5s ease",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          textAlign: "center",
+          gap: 14,
+          boxShadow: `0 8px 32px ${WAKE_UP_COLOR}15`
+        },
+        children: [/*#__PURE__*/_jsx("span", {
+          style: {
+            fontSize: 38,
+            color: WAKE_UP_COLOR,
+            opacity: 0.9
+          },
+          children: WAKE_UP_SEQUENCE.icon
+        }), /*#__PURE__*/_jsx("div", {
+          style: {
+            color: WAKE_UP_COLOR,
+            fontSize: 16,
+            letterSpacing: 4,
+            textTransform: "uppercase",
+            fontWeight: 500
+          },
+          children: WAKE_UP_SEQUENCE.label
+        }), /*#__PURE__*/_jsxs("div", {
+          style: {
+            color: "#ffffff55",
+            fontSize: 13,
+            letterSpacing: 1,
+            lineHeight: 1.5,
+            maxWidth: 280
+          },
+          children: [WAKE_UP_SEQUENCE.description, ". A guided sequence to ease into your day \u2014 breath, intention, and a soft landing."]
+        }), /*#__PURE__*/_jsx("div", {
+          style: {
+            marginTop: 10,
+            color: WAKE_UP_COLOR,
+            fontSize: 12,
+            letterSpacing: 4,
+            textTransform: "uppercase",
+            padding: "10px 22px",
+            background: `${WAKE_UP_COLOR}15`,
+            border: `1px solid ${WAKE_UP_COLOR}40`,
+            borderRadius: 24
+          },
+          children: "Begin"
+        })]
+      })
+    }), /*#__PURE__*/_jsx("div", {
+      style: {
+        textAlign: "center",
+        marginTop: 40,
+        color: "#ffffff20",
+        fontSize: 11,
+        letterSpacing: 3
+      },
+      children: "TAP TO BEGIN"
+    }), /*#__PURE__*/_jsx(SettingsSheet, {
+      open: showSettings,
+      prefs: prefs,
+      setPrefs: setPrefs,
+      onClose: () => setShowSettings(false),
+      color: "#85CDCA",
+      voiceName: voiceName,
+      voiceURI: voiceURI,
+      availableVoices: availableVoices,
+      previewVoice: previewVoice,
+      cloudTTS: cloudTTS,
+      voicePack: voicePack
+    })]
+  });
+}
+
+// ─── Tiny Stat component ───────────────────────────────────────
+function Stat({
+  label,
+  value,
+  color
+}) {
+  return /*#__PURE__*/_jsxs("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      gap: 4
+    },
+    children: [/*#__PURE__*/_jsx("span", {
+      style: {
+        fontSize: 22,
+        color: color,
+        fontWeight: 300,
+        fontVariantNumeric: "tabular-nums"
+      },
+      children: value
+    }), /*#__PURE__*/_jsx("span", {
+      style: {
+        fontSize: 10,
+        color: "#ffffff45",
+        letterSpacing: 2,
+        textTransform: "uppercase"
+      },
+      children: label
+    })]
+  });
+}
+document.getElementById("loading")?.remove();
+createRoot(document.getElementById("root")).render(jsx(MeditationApp, {}));
+</script></body></html>
